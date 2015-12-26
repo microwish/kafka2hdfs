@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # crontab
-# */1 * * * * /data/users/data-infra/kafka2hdfs/kafka2hdfs.sh 5 >> /data/users/data-infra/kafka2hdfs/kafka2hdfs.sh.log 2>&1
+# */1 * * * * sh /data/users/data-infra/kafka2hdfs/kafka2hdfs.sh 5 >> /data/users/data-infra/kafka2hdfs/kafka2hdfs.sh.log 2>&1
 
 # libjvm.so
 
@@ -37,7 +37,7 @@ export HADOOP_COMMON_LIB_NATIVE_DIR=/usr/lib/hadoop/lib/native
 
 num=$1
 
-procs=$(ps -ef | grep 'kafka2hdfs' | grep -v 'grep' | grep -vi 'java')
+procs=$(ps -ef | grep 'kafka2hdfs' | grep -v 'grep' | grep -vi 'java' | grep -vi 'lzop')
 
 for ((i=0; i<$num; i++))
 do
@@ -47,8 +47,8 @@ do
     else
         YmdHMs=$(date +%Y%m%d%H%M%S)
         echo "[$YmdHMs]kafka2hdfs#$i crashed or aborted"
-        /data/users/data-infra/kafka2hdfs/kafka2hdfs -k /data/users/data-infra/kafka2hdfs/kafka2hdfs$i.conf -c /data/users/data-infra/kafka2hdfs/consumer$i.properties -l /data/users/data-infra/kafka2hdfs/kafka2hdfs$i.log > /data/users/data-infra/kafka2hdfs/kafka2hdfs_stderr$i.log 2>&1 &
-        #valgrind -v --leak-check=full --show-reachable=yes --track-origins=yes --trace-children=yes --log-file=/data/users/data-infra/ka    fka2hdfs/memcheck$i.valgrind /data/users/data-infra/kafka2hdfs/kafka2hdfs -k /data/users/data-infra/kafka2hdfs/kafka2hdfs$i.conf -c /data/users/data-infra/kafka2hdfs/consumer$i.properties -l /data/users/data-infra/kafka2hdfs/kafka2hdfs$i.log > /data/users/data-infra/kafka2hdfs/kafka2hdfs_stderr$i.log 2>&1 &
-        sleep 2
+        /data/users/data-infra/kafka2hdfs/kafka2hdfs -k /data/users/data-infra/kafka2hdfs/kafka2hdfs$i.conf -c /data/users/data-infra/kafka2hdfs/consumer$i.properties -o stored -l /data/users/data-infra/kafka2hdfs/kafka2hdfs$i.log > /data/users/data-infra/kafka2hdfs/kafka2hdfs_stderr$i.log 2>&1 &
+        #valgrind -v --leak-check=full --show-reachable=yes --track-origins=yes --trace-children=yes --log-file=/data/users/data-infra/kafka2hdfs/memcheck$i.valgrind /data/users/data-infra/kafka2hdfs/kafka2hdfs -k /data/users/data-infra/kafka2hdfs/kafka2hdfs$i.conf -c /data/users/data-infra/kafka2hdfs/consumer$i.properties -o stored -l /data/users/data-infra/kafka2hdfs/kafka2hdfs$i.log > /data/users/data-infra/kafka2hdfs/kafka2hdfs_stderr$i.log 2>&1 &
+        #valgrind -v --tool=helgrind --trace-children=yes --log-file=/data/users/data-infra/kafka2hdfs/helgrind$i.valgrind /data/users/data-infra/kafka2hdfs/kafka2hdfs -k /data/users/data-infra/kafka2hdfs/kafka2hdfs$i.conf -c /data/users/data-infra/kafka2hdfs/consumer$i.properties -o stored -l /data/users/data-infra/kafka2hdfs/kafka2hdfs$i.log > /data/users/data-infra/kafka2hdfs/kafka2hdfs_stderr$i.log 2>&1 &
     fi
 done
