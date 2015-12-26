@@ -75,6 +75,8 @@ static pthread_rwlock_t fp_lock = PTHREAD_RWLOCK_INITIALIZER;
 
 static char *app_log_path = NULL;
 
+static int64_t start_offset = KAFKA_OFFSET_STORED;
+
 static bool align_YmdHM(char *YmdHM, int interval)
 {
     if (strlen(YmdHM) != 12) return false;
@@ -463,17 +465,17 @@ static bool build_local_path(const char *payload, const char *topic, long ymdhm,
                       "extract_device[%s] topic[%s] failed", payload, topic);
             return false;
         }
-        snprintf(path, 64, "%s%s/%s/%s_%ld_%s.seq",
+        snprintf(path, 128, "%s%s/%s/%s_%ld_%s.seq",
                  CWD_ROOT, RAW_LOG_PATH, topic, topic, ymdhm, device);
     } else if (strcmp(topic, "imp") == 0 || strcmp(topic, "ic") == 0) {
         int actiontype = extract_action_type(payload);
         switch (actiontype) {
         case 1: // impression
-            snprintf(path, 64, "%s%s/%s/imp_%ld.seq",
+            snprintf(path, 128, "%s%s/%s/imp_%ld.seq",
                      CWD_ROOT, RAW_LOG_PATH, topic, ymdhm);
             break;
         case 2: // click
-            snprintf(path, 64, "%s%s/%s/click_%ld.seq",
+            snprintf(path, 128, "%s%s/%s/click_%ld.seq",
                      CWD_ROOT, RAW_LOG_PATH, topic, ymdhm);
             break;
         default:
@@ -486,11 +488,11 @@ static bool build_local_path(const char *payload, const char *topic, long ymdhm,
         int actiontype = extract_action_type(payload);
         switch (actiontype) {
         case 11: // impression
-            snprintf(path, 64, "%s%s/%s/imp_%ld.seq",
+            snprintf(path, 128, "%s%s/%s/imp_%ld.seq",
                      CWD_ROOT, RAW_LOG_PATH, topic, ymdhm);
             break;
         case 12: // click
-            snprintf(path, 64, "%s%s/%s/click_%ld.seq",
+            snprintf(path, 128, "%s%s/%s/click_%ld.seq",
                      CWD_ROOT, RAW_LOG_PATH, topic, ymdhm);
             break;
         default: // invalid for ic or stats
@@ -500,7 +502,7 @@ static bool build_local_path(const char *payload, const char *topic, long ymdhm,
             return false;
         }
     } else {
-        snprintf(path, 64, "%s%s/%s/%s_%ld.seq",
+        snprintf(path, 128, "%s%s/%s/%s_%ld.seq",
                  CWD_ROOT, RAW_LOG_PATH, topic, topic, ymdhm);
     }
 
@@ -541,7 +543,7 @@ static bool write_raw_file(const char *topic, const char *payload, size_t len)
     }
 
     // local path
-    char loc_path[64];
+    char loc_path[128];
     if (!build_local_path(payload, topic, ymdhm, loc_path)) return false;
 
     FILE *fp = retrieve_fp(loc_path);
@@ -577,7 +579,6 @@ static void *consume_to_local(void *arg)
 
     ThrArg *a = (ThrArg *)arg;
     int ret = 0;
-    int64_t start_offset = KAFKA_OFFSET_STORED;
 
     int n = consume_messages(consumer, a->kct, a->partno,
                              start_offset, consume);
@@ -894,8 +895,7 @@ static bool build_hdfs_path(const char *topic, const char *bn, char *path)
 static int hdfs_put(const char *loc_path, const char *hdfs_path)
 {
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "%s %s%s %s",
-             HDFS_PUT, CWD_ROOT, loc_path, hdfs_path);
+    snprintf(cmd, sizeof(cmd), "%s %s %s", HDFS_PUT, loc_path, hdfs_path);
 write_log(app_log_path, LOG_INFO, "exec-ing cmd[%s]", cmd);
     return wrap_system(cmd);
 }
@@ -905,8 +905,7 @@ write_log(app_log_path, LOG_INFO, "exec-ing cmd[%s]", cmd);
 static int hdfs_append(const char *loc_path, const char *hdfs_path)
 {
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "%s %s%s %s",
-             HDFS_APPEND, CWD_ROOT, loc_path, hdfs_path);
+    snprintf(cmd, sizeof(cmd), "%s %s %s", HDFS_APPEND, loc_path, hdfs_path);
 write_log(app_log_path, LOG_INFO, "exec-ing cmd[%s]", cmd);
     return wrap_system(cmd);
 }
@@ -1057,7 +1056,7 @@ rtn:
     return ret;
 }
 
-static int copy_ex(const char *topic, const char *zfile)
+static int copy_ex(const char *topic, const char *zfile, bool indexed = true)
 {
     char hdfs_path[256];
     if (!build_hdfs_path(topic, basename(zfile), hdfs_path)) {
@@ -1091,7 +1090,7 @@ write_log(app_log_path, LOG_INFO, "hdfs_append[%s] OK", zfile);
             return -1;
         }
     }
-    if (hdfs_lzo_index(hdfs_path) == 0) {
+    if (indexed && hdfs_lzo_index(hdfs_path) == 0) {
 write_log(app_log_path, LOG_INFO, "hdfs_lzo_index[%s] OK", hdfs_path);
     }
     return 0;
@@ -1148,7 +1147,7 @@ static void *copy_to_hdfs(void *arg)
         } else {
             snprintf(path + n, sizeof(path) - n, "/%s", dep->d_name);
             if (!is_write_finished(path, topic)) continue;
-            if (copy(topic, path) == 0) {
+            if (copy(topic, path) == 0 || copy_ex(topic, path, false) == 0) {
                 rm_local(path);
                 cleanup_fp(path);
             }
@@ -1183,10 +1182,10 @@ static void sa_callback(int signum, siginfo_t *si, void *uc)
 int main(int argc, char *argv[])
 {
     int opt;
-    char *k2h_conf_path;
+    char *k2h_conf_path, *offset_opt;
 
     do {
-        opt = getopt(argc, argv, "c:k:l:");
+        opt = getopt(argc, argv, "c:k:l:o:");
         switch (opt) {
         case 'c':
             consumer_conf_path = optarg;
@@ -1201,12 +1200,27 @@ int main(int argc, char *argv[])
             app_log_path = optarg;
             fprintf(stderr, "app log path for kafka2hdfs: %s\n", app_log_path);
             break;
+        case 'o':
+            offset_opt = optarg;
+            fprintf(stderr, "offset option for kafka2hdfs: %s\n", offset_opt);
+            break;
         default:
             // XXX
             fprintf(stderr, "Usage: ./kafka2hdfs -c -k\n");
             continue;
         }
     } while (opt != -1);
+
+    if (strcmp(offset_opt, "stored") == 0) {
+        start_offset = KAFKA_OFFSET_STORED;
+    } else if (strcmp(offset_opt, "beginning") == 0) {
+        start_offset = KAFKA_OFFSET_BEGINNING;
+    } else if (strcmp(offset_opt, "end") == 0) {
+        start_offset = KAFKA_OFFSET_END;
+    } else {
+        fprintf(stderr, "Invalid offset option[%s], default \"stored\"",
+                offset_opt);
+    }
 
 #if 0
     struct sigaction act;
