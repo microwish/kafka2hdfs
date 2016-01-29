@@ -19,6 +19,8 @@ extern "C" {
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/select.h>
 #include <syslog.h>
 #include <dirent.h>
 #include <stddef.h>
@@ -68,7 +70,7 @@ static const char *hdfs_path_selfmedia = "/user/data-infra/selfmedia";
 static const char *hdfs_path_logAccess = "/user/data-infra/log_access";
 static const char *hdfs_path_3rdStats = "/user/data-infra/3th_stats";
 static const char *hdfs_path_rc = "/user/data-infra/rc";
-static std::map<std::string, const char *> topic_hdfs_map;
+static std::map<const char *, const char *> topic_hdfs_map;
 
 static std::map<std::string, FILE *> fp_cache;
 static pthread_rwlock_t fp_lock = PTHREAD_RWLOCK_INITIALIZER;
@@ -438,11 +440,13 @@ static void cleanup_fp(const char *filename)
 
 static void clear_fp_cache()
 {
+    pthread_rwlock_wrlock(&fp_lock);
     for (std::map<std::string, FILE *>::iterator it = fp_cache.begin();
          it != fp_cache.end(); it++) {
         fclose(it->second);
     }
     fp_cache.clear();
+    pthread_rwlock_unlock(&fp_lock);
 }
 
 static bool is_digit_str(const char *s, size_t l)
@@ -509,6 +513,17 @@ static bool build_local_path(const char *payload, const char *topic, long ymdhm,
     return true;
 }
 
+static void delay_simply(int milli)
+{
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = milli * 1000;
+    if (select(0, NULL, NULL, NULL, &tv) == -1) {
+        write_log(app_log_path, LOG_ERR,
+                  "select failed with errno[%d]", errno);
+    }
+}
+
 static bool write_raw_file(const char *topic, const char *payload, size_t len)
 {
     std::map<std::string, int>::const_iterator it =
@@ -543,7 +558,7 @@ static bool write_raw_file(const char *topic, const char *payload, size_t len)
     }
 
     // local path
-    char loc_path[128];
+    char loc_path[256];
     if (!build_local_path(payload, topic, ymdhm, loc_path)) return false;
 
     FILE *fp = retrieve_fp(loc_path);
@@ -551,11 +566,18 @@ static bool write_raw_file(const char *topic, const char *payload, size_t len)
         write_log(app_log_path, LOG_ERR, "retrieve_fp[%s] failed", loc_path);
         return false;
     }
+
+    int count = 0;
     size_t n = fwrite(payload, 1, len, fp);
-    if (n != len) {
-        write_log(app_log_path, LOG_ERR,
-                  "fwrite[%s] failed expected[%lu] written[%lu]",
-                  loc_path, len, n);
+    while (n != len) {
+        if (++count == 3) break;
+        delay_simply(100 * count);
+        len -= n;
+        payload += n;
+        n = fwrite(payload, 1, len, fp);
+    }
+    if (count == 3) {
+        write_log(app_log_path, LOG_ERR, "fwrite[%s] failed", loc_path);
         return false;
     }
     fputc('\n', fp);
@@ -618,6 +640,17 @@ static time_t get_mtime(const char *path)
     return stbuf.st_mtime;
 }
 
+static time_t get_file_size(const char *path)
+{
+    struct stat stbuf;
+    if (stat(path, &stbuf) != 0) {
+        write_log(app_log_path, LOG_ERR,
+                  "stat[%s] for size failed with errno[%d]", path, errno);
+        return -1;
+    }
+    return stbuf.st_size;
+}
+
 #define BUFFER_MINUTES 5
 
 static bool is_write_finished(const char *path, const char *topic)
@@ -625,6 +658,7 @@ static bool is_write_finished(const char *path, const char *topic)
     time_t mt = get_mtime(path);
     if (mt == -1) return false;
 
+#if 0
     std::map<std::string, int>::const_iterator it =
         upload_intervals.find(topic);
     if (it == upload_intervals.end()) {
@@ -632,6 +666,7 @@ static bool is_write_finished(const char *path, const char *topic)
                   "misconfigured interval for topic[%s]", topic);
         return false;
     }
+#endif
 
     // XXX how long to delay?
     // front-end machines --> Kafka --> consumer
@@ -642,7 +677,7 @@ static inline void rm_local(const char *f, int flag = 1)
 {
     switch (flag) {
     case 1: // delete
-write_log(app_log_path, LOG_INFO, "unlinking[%s]", f);
+write_log(app_log_path, LOG_INFO, "DEBUG unlinking[%s]", f);
         if (unlink(f) != 0) {
             write_log(app_log_path, LOG_WARNING,
                       "unlink[%s] failed with errno[%d]", f, errno);
@@ -699,9 +734,11 @@ static int lzo_compress(const char *in_path)
 {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "%s %s", LZOP, in_path);
-write_log(app_log_path, LOG_INFO, "exec-ing cmd[%s]", cmd);
+write_log(app_log_path, LOG_INFO, "DEBUG exec-ing cmd[%s]", cmd);
     return wrap_system(cmd);
 }
+
+#define MAX_FILE_SIZE 8589934592 // 8G
 
 // only bid and unbid need to be compressed
 static void *compress_files(void *arg)
@@ -727,7 +764,6 @@ static void *compress_files(void *arg)
     char path[sizeof(RAW_LOG_PATH) + 128], path2[sizeof(RAW_LOG_PATH) + 128];
     int n = snprintf(path, sizeof(path), "%s%s/%s",
                      CWD_ROOT, RAW_LOG_PATH, topic);
-    memcpy(path2, path, n);
 
     DIR *dp = opendir(path);
     if (dp == NULL) {
@@ -746,6 +782,8 @@ static void *compress_files(void *arg)
         return (void *)-1;
     }
 
+    memcpy(path2, path, n);
+
     struct dirent *res;
     while (readdir_r(dp, dep, &res) == 0) {
         if (res == NULL) {
@@ -761,7 +799,8 @@ static void *compress_files(void *arg)
             snprintf(path + n, sizeof(path) - n, "/%s", dep->d_name);
             if (is_write_finished(path, topic)) {
                 if (lzo_compress(path) == 0) {
-write_log(app_log_path, LOG_INFO, "lzo_compress[%s] OK", path);
+                    write_log(app_log_path, LOG_INFO,
+                              "DEBUG lzo_compress[%s] OK", path);
                     cleanup_fp(path);
                     strcat(path, ".inpro");
                     snprintf(path2 + n, sizeof(path2) - n, "/%s.lzo", dep->d_name);
@@ -771,23 +810,23 @@ write_log(app_log_path, LOG_INFO, "lzo_compress[%s] OK", path);
                                   path, errno);
                     }
                 }
-            } else if (diff_atime_mtime(path) > upload_intervals[topic] * 30) {
+            } else if (get_file_size(path) > MAX_FILE_SIZE) {
                 snprintf(path2 + n, sizeof(path2) - n, "/%s.%ld",
                          dep->d_name, time(NULL));
+                write_log(app_log_path, LOG_INFO, "DEBUG path[%s] too large", path2);
                 // XXX
                 rename(path, path2);
                 cleanup_fp(path);
-            }
-        } else if (*p >= '1' && *p <= '9') {
-            snprintf(path + n, sizeof(path) - n, "/%s", dep->d_name);
-            if (lzo_compress(path) == 0) {
-write_log(app_log_path, LOG_INFO, "lzo_compress[%s] OK", path);
-                strcat(path, ".inpro");
-                snprintf(path2 + n, sizeof(path2) - n, "/%s.lzo", dep->d_name);
-                if (rename(path, path2) != 0) {
-                    write_log(app_log_path, LOG_ERR,
-                              "rename[%s] failed with errno[%d]",
-                              path, errno);
+                if (lzo_compress(path2) == 0) {
+                    write_log(app_log_path, LOG_INFO,
+                              "DEBUG lzo_compress[%s] OK", path2);
+                    snprintf(path, sizeof(path), "%s.lzo", path2);
+                    strcat(path2, ".inpro");
+                    if (rename(path2, path) != 0) {
+                        write_log(app_log_path, LOG_ERR,
+                                  "rename[%s] failed with errno[%d]",
+                                  path2, errno);
+                    }
                 }
             }
         }
@@ -807,29 +846,29 @@ static void init_topic_hdfs_map()
     for (int i = 0; i < topic_total; i++) {
         char *topic = topics[i];
         if (strcmp(topic, "bid") == 0) {
-            topic_hdfs_map["bid"] = hdfs_path_expressBid;
+            topic_hdfs_map[topic] = hdfs_path_expressBid;
         } else if (strcmp(topic, "unbid") == 0) {
-            topic_hdfs_map["unbid"] = hdfs_path_expressBid;
+            topic_hdfs_map[topic] = hdfs_path_expressBid;
         } else if (strcmp(topic, "pdb-bid") == 0) {
-            topic_hdfs_map["pdb-bid"] = hdfs_path_selfmedia;
+            topic_hdfs_map[topic] = hdfs_path_selfmedia;
         } else if (strcmp(topic, "pdb-unbid") == 0) {
-            topic_hdfs_map["pdb-unbid"] = hdfs_path_selfmedia;
+            topic_hdfs_map[topic] = hdfs_path_selfmedia;
         } else if (strcmp(topic, "imp") == 0) {
-            topic_hdfs_map["imp"] = hdfs_path_selfmedia;
+            topic_hdfs_map[topic] = hdfs_path_selfmedia;
         } else if (strcmp(topic, "unimp") == 0) {
-            topic_hdfs_map["unimp"] = hdfs_path_selfmedia;
+            topic_hdfs_map[topic] = hdfs_path_selfmedia;
         } else if (strcmp(topic, "adv") == 0) {
-            topic_hdfs_map["adv"] = hdfs_path_express;
+            topic_hdfs_map[topic] = hdfs_path_express;
         } else if (strcmp(topic, "cvt") == 0) {
-            topic_hdfs_map["cvt"] = hdfs_path_express;
+            topic_hdfs_map[topic] = hdfs_path_express;
         } else if (strcmp(topic, "ic") == 0) {
-            topic_hdfs_map["ic"] = hdfs_path_express;
+            topic_hdfs_map[topic] = hdfs_path_express;
         } else if (strcmp(topic, "pub") == 0) {
-            topic_hdfs_map["pub"] = hdfs_path_logAccess;
+            topic_hdfs_map[topic] = hdfs_path_logAccess;
         } else if (strcmp(topic, "stats") == 0) {
-            topic_hdfs_map["stats"] = hdfs_path_3rdStats;
+            topic_hdfs_map[topic] = hdfs_path_3rdStats;
         } else if (strcmp(topic, "rc") == 0) {
-            topic_hdfs_map["rc"] = hdfs_path_rc;
+            topic_hdfs_map[topic] = hdfs_path_rc;
         }
     }
 }
@@ -896,7 +935,7 @@ static int hdfs_put(const char *loc_path, const char *hdfs_path)
 {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "%s %s %s", HDFS_PUT, loc_path, hdfs_path);
-write_log(app_log_path, LOG_INFO, "exec-ing cmd[%s]", cmd);
+write_log(app_log_path, LOG_INFO, "DEBUG exec-ing cmd[%s]", cmd);
     return wrap_system(cmd);
 }
 
@@ -906,7 +945,7 @@ static int hdfs_append(const char *loc_path, const char *hdfs_path)
 {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "%s %s %s", HDFS_APPEND, loc_path, hdfs_path);
-write_log(app_log_path, LOG_INFO, "exec-ing cmd[%s]", cmd);
+write_log(app_log_path, LOG_INFO, "DEBUG exec-ing cmd[%s]", cmd);
     return wrap_system(cmd);
 }
 
@@ -917,7 +956,7 @@ static int hdfs_lzo_index(const char *hdfs_path)
 {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "%s %s", HADOOP_LZO_INDEX, hdfs_path);
-write_log(app_log_path, LOG_INFO, "exec-ing cmd[%s]", cmd);
+write_log(app_log_path, LOG_INFO, "DEBUG exec-ing cmd[%s]", cmd);
     return wrap_system(cmd);
 }
 
@@ -963,14 +1002,14 @@ static int copy(const char *topic, const char *zfile)
         *p = '/';
         if (existing) {
             if (hdfs_append(zfile, hdfs_path) == 0) {
-write_log(app_log_path, LOG_INFO, "hdfs_append[%s] OK", zfile);
+write_log(app_log_path, LOG_INFO, "DEBUG hdfs_append[%s] OK", zfile);
                 return 0;
             } else {
                 return -1;
             }
         } else {
             if (hdfs_put(zfile, hdfs_path) == 0) {
-write_log(app_log_path, LOG_INFO, "hdfs_put[%s] OK", zfile);
+write_log(app_log_path, LOG_INFO, "DEBUG hdfs_put[%s] OK", zfile);
                 return 0;
             } else {
                 return -1;
@@ -1079,19 +1118,19 @@ static int copy_ex(const char *topic, const char *zfile, bool indexed = true)
     snprintf(cmd, sizeof(cmd), "hadoop fs -test -e %s", hdfs_path);
     if (wrap_system(cmd, false) != 0) {
         if (hdfs_put(zfile, hdfs_path) == 0) {
-write_log(app_log_path, LOG_INFO, "hdfs_put[%s] OK", zfile);
+write_log(app_log_path, LOG_INFO, "DEBUG hdfs_put[%s] OK", zfile);
         } else {
             return -1;
         }
     } else {
         if (hdfs_append(zfile, hdfs_path) == 0) {
-write_log(app_log_path, LOG_INFO, "hdfs_append[%s] OK", zfile);
+write_log(app_log_path, LOG_INFO, "DEBUG hdfs_append[%s] OK", zfile);
         } else {
             return -1;
         }
     }
     if (indexed && hdfs_lzo_index(hdfs_path) == 0) {
-write_log(app_log_path, LOG_INFO, "hdfs_lzo_index[%s] OK", hdfs_path);
+write_log(app_log_path, LOG_INFO, "DEBUG hdfs_lzo_index[%s] OK", hdfs_path);
     }
     return 0;
 }
@@ -1120,7 +1159,7 @@ static void *copy_to_hdfs(void *arg)
         return (void *)-1;
     }
 
-    size_t el = offsetof(struct dirent, d_name) + 32;
+    size_t el = offsetof(struct dirent, d_name) + 64;
     struct dirent *dep = (struct dirent *)malloc(el);
     if (dep == NULL) {
         write_log(app_log_path, LOG_ERR, "malloc failed");
@@ -1248,6 +1287,14 @@ int main(int argc, char *argv[])
     write_log(app_log_path, LOG_INFO, "consuming thread total[%d]", thr_total);
 
     extract_intervals(k2h_conf["topic-interval-map"]);
+#if 1
+for (std::map<std::string, int>::const_iterator it =
+     upload_intervals.begin(); it != upload_intervals.end(); it++) {
+    write_log(app_log_path, LOG_INFO,
+              "DEBUG topic[%s] interval[%d]\n",
+              it->first.c_str(), it->second);
+}
+#endif
 
     init_topic_hdfs_map();
 
