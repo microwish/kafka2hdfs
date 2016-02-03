@@ -1241,10 +1241,15 @@ static void *enqueue_upload_files(void *arg)
                     pthread_mutex_unlock(&mtx);
                 }
             }
+            free(dep);
         }
 
         sleep(70);
     } while (true);
+
+    free(namelist);
+    write_log(app_log_path, LOG_ERR, "thread copy_to_hdfs"
+              " for topic[%s] exiting", topic);
 
     return (void *)0;
 }
