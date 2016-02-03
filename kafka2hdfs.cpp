@@ -32,6 +32,7 @@ extern "C" {
 #include <string>
 #include <map>
 #include <vector>
+#include <deque>
 #include <sstream>
 
 #define CWD_ROOT "/data/users/data-infra/kafka2hdfs/"
@@ -79,6 +80,9 @@ static char *app_log_path = NULL;
 
 static int64_t start_offset = KAFKA_OFFSET_STORED;
 
+static std::map<std::string, std::deque<std::string> > upload_queues;
+static std::map<std::string, pthread_mutex_t> upload_mutexes;
+
 static bool align_YmdHM(char *YmdHM, int interval)
 {
     if (strlen(YmdHM) != 12) return false;
@@ -86,7 +90,7 @@ static bool align_YmdHM(char *YmdHM, int interval)
     struct tm r;
     char c;
 
-    r.tm_sec = 1;
+    r.tm_sec = 0;
     r.tm_min = atoi(YmdHM + 10);
 
     c = YmdHM[10];
@@ -458,6 +462,7 @@ static bool is_digit_str(const char *s, size_t l)
 }
 
 #define RAW_LOG_PATH "./k2h_log"
+#define UPLOAD_PATH "./upload"
 
 static bool build_local_path(const char *payload, const char *topic, long ymdhm,
                              char *path)
@@ -571,7 +576,7 @@ static bool write_raw_file(const char *topic, const char *payload, size_t len)
     size_t n = fwrite(payload, 1, len, fp);
     while (n != len) {
         if (++count == 3) break;
-        delay_simply(100 * count);
+        delay_simply(500 * count);
         len -= n;
         payload += n;
         n = fwrite(payload, 1, len, fp);
@@ -653,7 +658,8 @@ static time_t get_file_size(const char *path)
 
 #define BUFFER_MINUTES 5
 
-static bool is_write_finished(const char *path, const char *topic)
+//static bool is_write_finished(const char *path, const char *topic)
+static bool is_write_finished(const char *path)
 {
     time_t mt = get_mtime(path);
     if (mt == -1) return false;
@@ -677,7 +683,7 @@ static inline void rm_local(const char *f, int flag = 1)
 {
     switch (flag) {
     case 1: // delete
-write_log(app_log_path, LOG_INFO, "DEBUG unlinking[%s]", f);
+        write_log(app_log_path, LOG_INFO, "DEBUG unlinking[%s]", f);
         if (unlink(f) != 0) {
             write_log(app_log_path, LOG_WARNING,
                       "unlink[%s] failed with errno[%d]", f, errno);
@@ -727,49 +733,61 @@ static int wrap_system(const char *cmd, bool logged = true)
     return ret;
 }
 
-#define LZOP "/usr/local/bin/lzop -1 -U -f -S .inpro --ignore-warn"
+//#define LZOP "/usr/local/bin/lzop -1 -U -f -S .inpro --ignore-warn"
+#define LZOP "/usr/local/bin/lzop -1 -U -f --ignore-warn"
 
 // TODO should be implemented using lzo lib directly
 static int lzo_compress(const char *in_path)
 {
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "%s %s", LZOP, in_path);
-write_log(app_log_path, LOG_INFO, "DEBUG exec-ing cmd[%s]", cmd);
+    //snprintf(cmd, sizeof(cmd), "%s %s &", LZOP, in_path);
+    snprintf(cmd, sizeof(cmd), "%s %s &", LZOP, in_path);
+    write_log(app_log_path, LOG_INFO, "DEBUG exec-ing cmd[%s]", cmd);
     return wrap_system(cmd);
 }
 
-#define MAX_FILE_SIZE 8589934592 // 8G
+#define MAX_FILE_SIZE 6442450944 // 6G
 
 // only bid and unbid need to be compressed
 static void *compress_files(void *arg)
 {
-    write_log(app_log_path, LOG_INFO, "thread compress_files created");
+    char *topic = (char *)arg;
+    write_log(app_log_path, LOG_INFO, "thread compress_files"
+              " for topic[%s] created", topic);
 
     int ret = pthread_detach(pthread_self());
     if (ret != 0) {
-        write_log(app_log_path, LOG_ERR, "pthread_detach[compress_files] failed"
-                  " with errno[%d]", ret);
-        write_log(app_log_path, LOG_ERR, "thread compress_files exiting");
+        write_log(app_log_path, LOG_ERR, "pthread_detach[compress_files]"
+                  " failed with errno[%d]", ret);
+        write_log(app_log_path, LOG_ERR, "thread compress_files"
+                  " for topic[%s] exiting", topic);
         return (void *)-1;
     }
 
-    char *topic = (char *)arg;
     if (strcmp(topic, "bid") != 0 && strcmp(topic, "unbid") != 0) {
         write_log(app_log_path, LOG_WARNING,
                   "topic[%s] need not to be compressed", topic);
-        write_log(app_log_path, LOG_ERR, "thread compress_files exiting");
+        write_log(app_log_path, LOG_ERR, "thread compress_files"
+                  " for topic[%s] exiting", topic);
         return (void *)-1;
     }
 
     char path[sizeof(RAW_LOG_PATH) + 128], path2[sizeof(RAW_LOG_PATH) + 128];
     int n = snprintf(path, sizeof(path), "%s%s/%s",
                      CWD_ROOT, RAW_LOG_PATH, topic);
+    if (n < 0) {
+        write_log(app_log_path, LOG_ERR, "snprintf topic[%s] failed", topic);
+        write_log(app_log_path, LOG_ERR, "thread compress_files"
+                  " for topic[%s] exiting", topic);
+        return (void *)-1;
+    }
 
     DIR *dp = opendir(path);
     if (dp == NULL) {
         write_log(app_log_path, LOG_ERR,
                   "opendir[%s] failed with errno[%d]", path, errno);
-        write_log(app_log_path, LOG_ERR, "thread compress_files exiting");
+        write_log(app_log_path, LOG_ERR, "thread compress_files"
+                  " for topic[%s] exiting", topic);
         return (void *)-1;
     }
 
@@ -778,7 +796,8 @@ static void *compress_files(void *arg)
     if (dep == NULL) {
         write_log(app_log_path, LOG_ERR, "malloc failed");
         closedir(dp);
-        write_log(app_log_path, LOG_ERR, "thread compress_files exiting");
+        write_log(app_log_path, LOG_ERR, "thread compress_files"
+                  " for topic[%s] exiting", topic);
         return (void *)-1;
     }
 
@@ -797,38 +816,26 @@ static void *compress_files(void *arg)
         char *p = strrchr(dep->d_name, '.') + 1;
         if (strncmp(p, "seq", 3) == 0) {
             snprintf(path + n, sizeof(path) - n, "/%s", dep->d_name);
-            if (is_write_finished(path, topic)) {
-                if (lzo_compress(path) == 0) {
-                    write_log(app_log_path, LOG_INFO,
-                              "DEBUG lzo_compress[%s] OK", path);
-                    cleanup_fp(path);
-                    strcat(path, ".inpro");
-                    snprintf(path2 + n, sizeof(path2) - n, "/%s.lzo", dep->d_name);
-                    if (rename(path, path2) != 0) {
-                        write_log(app_log_path, LOG_ERR,
-                                  "rename[%s] failed with errno[%d]",
-                                  path, errno);
-                    }
-                }
+            if (is_write_finished(path)) {
+                snprintf(path2 + n, sizeof(path2) - n, "/%s.0", dep->d_name);
+                write_log(app_log_path, LOG_INFO,
+                          "DEBUG path[%s] writing finished", path);
             } else if (get_file_size(path) > MAX_FILE_SIZE) {
                 snprintf(path2 + n, sizeof(path2) - n, "/%s.%ld",
                          dep->d_name, time(NULL));
                 write_log(app_log_path, LOG_INFO, "DEBUG path[%s] too large", path2);
-                // XXX
-                rename(path, path2);
-                cleanup_fp(path);
-                if (lzo_compress(path2) == 0) {
-                    write_log(app_log_path, LOG_INFO,
-                              "DEBUG lzo_compress[%s] OK", path2);
-                    snprintf(path, sizeof(path), "%s.lzo", path2);
-                    strcat(path2, ".inpro");
-                    if (rename(path2, path) != 0) {
-                        write_log(app_log_path, LOG_ERR,
-                                  "rename[%s] failed with errno[%d]",
-                                  path2, errno);
-                    }
-                }
+            } else {
+                continue;
             }
+            // XXX
+            if (rename(path, path2) != 0) {
+                write_log(app_log_path, LOG_ERR, "rename[%s to %s] failed"
+                          " with errno[%d]", path, path2, errno);
+                continue;
+            }
+            cleanup_fp(path);
+            // TODO non-blocking exit code
+            lzo_compress(path2);
         }
     }
     write_log(app_log_path, LOG_ERR,
@@ -836,7 +843,8 @@ static void *compress_files(void *arg)
 
     free(dep);
     closedir(dp);
-    write_log(app_log_path, LOG_ERR, "thread compress_files exiting");
+    write_log(app_log_path, LOG_ERR, "thread compress_files"
+              " for topic[%s] exiting", topic);
 
     return (void *)0;
 }
@@ -935,7 +943,7 @@ static int hdfs_put(const char *loc_path, const char *hdfs_path)
 {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "%s %s %s", HDFS_PUT, loc_path, hdfs_path);
-write_log(app_log_path, LOG_INFO, "DEBUG exec-ing cmd[%s]", cmd);
+    write_log(app_log_path, LOG_INFO, "DEBUG exec-ing cmd[%s]", cmd);
     return wrap_system(cmd);
 }
 
@@ -945,7 +953,7 @@ static int hdfs_append(const char *loc_path, const char *hdfs_path)
 {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "%s %s %s", HDFS_APPEND, loc_path, hdfs_path);
-write_log(app_log_path, LOG_INFO, "DEBUG exec-ing cmd[%s]", cmd);
+    write_log(app_log_path, LOG_INFO, "DEBUG exec-ing cmd[%s]", cmd);
     return wrap_system(cmd);
 }
 
@@ -955,8 +963,9 @@ write_log(app_log_path, LOG_INFO, "DEBUG exec-ing cmd[%s]", cmd);
 static int hdfs_lzo_index(const char *hdfs_path)
 {
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "%s %s", HADOOP_LZO_INDEX, hdfs_path);
-write_log(app_log_path, LOG_INFO, "DEBUG exec-ing cmd[%s]", cmd);
+    //snprintf(cmd, sizeof(cmd), "%s %s", HADOOP_LZO_INDEX, hdfs_path);
+    snprintf(cmd, sizeof(cmd), "%s %s &", HADOOP_LZO_INDEX, hdfs_path);
+    write_log(app_log_path, LOG_INFO, "DEBUG exec-ing cmd[%s]", cmd);
     return wrap_system(cmd);
 }
 
@@ -1002,14 +1011,16 @@ static int copy(const char *topic, const char *zfile)
         *p = '/';
         if (existing) {
             if (hdfs_append(zfile, hdfs_path) == 0) {
-write_log(app_log_path, LOG_INFO, "DEBUG hdfs_append[%s] OK", zfile);
+                write_log(app_log_path, LOG_INFO,
+                          "DEBUG hdfs_append[%s] OK", zfile);
                 return 0;
             } else {
                 return -1;
             }
         } else {
             if (hdfs_put(zfile, hdfs_path) == 0) {
-write_log(app_log_path, LOG_INFO, "DEBUG hdfs_put[%s] OK", zfile);
+                write_log(app_log_path, LOG_INFO,
+                          "DEBUG hdfs_put[%s] OK", zfile);
                 return 0;
             } else {
                 return -1;
@@ -1135,71 +1146,158 @@ write_log(app_log_path, LOG_INFO, "DEBUG hdfs_lzo_index[%s] OK", hdfs_path);
     return 0;
 }
 
+static int scandir_filter(const struct dirent *dep)
+{
+    if (strcmp(dep->d_name, ".") == 0 || strcmp(dep->d_name, "..") == 0) {
+        return 0;
+    }
+    if (strncmp(dep->d_name, "unbid", sizeof("unbid") - 1) == 0
+        || strncmp(dep->d_name, "bid", sizeof("bid") - 1) == 0) {
+        const char *p = strrchr(dep->d_name, '.');
+        if (p == NULL) return 0;
+        return strncmp(p + 1, "lzo", 3) == 0 ? 1 : 0;
+    } else {
+        return 1;
+    }
+}
+
+static int scandir_compar(const struct dirent **a, const struct dirent **b)
+{
+    if (strncmp((*a)->d_name, "unbid", sizeof("unbid") - 1) == 0
+        || strncmp((*a)->d_name, "bid", sizeof("bid") - 1) == 0) {
+        const char *p = strchr((*a)->d_name, '_'),
+              *q = strchr((*b)->d_name, '_');
+        int r = strncmp(p + 1, q + 1, 12);
+        if (r == 0) {
+            p = strchr(p, '.');
+            q = strchr(q, '.');
+            return strcmp(p + 1, q + 1);
+        } else {
+            return r;
+        }
+    } else {
+        return strcmp((*a)->d_name, (*b)->d_name);
+    }
+}
+
+static void *enqueue_upload_files(void *arg)
+{
+    char *topic = (char *)arg;
+    write_log(app_log_path, LOG_INFO, "thread enqueue_upload_files"
+              " for topic[%s] created", topic);
+
+    int ret = pthread_detach(pthread_self());
+    if (ret != 0) {
+        write_log(app_log_path, LOG_ERR, "pthread_detach[enqueue_upload_files]"
+                  " failed with errno[%d]", ret);
+        write_log(app_log_path, LOG_ERR, "thread enqueue_upload_files"
+                  " for topic[%s] exiting", topic);
+        return (void *)-1;
+    }
+
+    char path[sizeof(RAW_LOG_PATH) + 128];
+    int n = snprintf(path, sizeof(path), "%s%s/%s",
+                     CWD_ROOT, RAW_LOG_PATH, topic);
+    if (n < 0) {
+        write_log(app_log_path, LOG_ERR, "snprintf failed");
+        write_log(app_log_path, LOG_ERR, "thread copy_to_hdfs"
+                  " for topic[%s] exiting", topic);
+        return (void *)-1;
+    }
+
+    char path2[sizeof(RAW_LOG_PATH) + 128];
+    struct dirent **namelist = NULL;
+    std::deque<std::string>& que = upload_queues[topic];
+    pthread_mutex_t& mtx = upload_mutexes[topic];
+
+    do {
+        path[n] = '\0';
+
+        int num = scandir(path, &namelist, scandir_filter, scandir_compar);
+        if (num == -1) {
+            write_log(app_log_path, LOG_ERR, "scandir[%s] failed"
+                      " with errno[%d]", path, errno);
+        }
+        for (int i = 0; i < num; i++) {
+            struct dirent *dep = namelist[i];
+            if (snprintf(path + n, sizeof(path) - n, "/%s", dep->d_name) < 0) {
+                continue;
+            }
+            if (is_write_finished(path)) {
+                if (snprintf(path2, sizeof(path2), "%s%s/%s/%s",
+                             CWD_ROOT, UPLOAD_PATH, topic, dep->d_name) < 0) {
+                    continue;
+                }
+                if (rename(path, path2) != 0) {
+                    write_log(app_log_path, LOG_ERR, "rename[%s:%s] failed"
+                              " with errno[%d]", path, path2, errno);
+                } else {
+                    if (strcmp(topic, "bid") != 0
+                        && strcmp(topic, "unbid") != 0) {
+                        cleanup_fp(path);
+                    }
+                    pthread_mutex_lock(&mtx);
+                    que.push_back(path2);
+                    pthread_mutex_unlock(&mtx);
+                }
+            }
+        }
+
+        sleep(70);
+    } while (true);
+
+    return (void *)0;
+}
+
+#define POP_NUM 2
+
 static void *copy_to_hdfs(void *arg)
 {
-    write_log(app_log_path, LOG_INFO, "thread copy_to_hdfs created");
+    char *topic = (char *)arg;
+    write_log(app_log_path, LOG_INFO, "thread copy_to_hdfs"
+              " for topic[%s] created", topic);
 
     int ret = pthread_detach(pthread_self());
     if (ret != 0) {
         write_log(app_log_path, LOG_ERR, "pthread_detach[copy_to_hdfs] failed"
                   " with errno[%d]", ret);
-        write_log(app_log_path, LOG_ERR, "thread copy_to_hdfs exiting");
+        write_log(app_log_path, LOG_ERR, "thread copy_to_hdfs"
+                  " for topic[%s] exiting", topic);
         return (void *)-1;
     }
 
-    char path[sizeof(RAW_LOG_PATH) + 128], *topic = (char *)arg;
-    int n = snprintf(path, sizeof(path), "%s%s/%s",
-                     CWD_ROOT, RAW_LOG_PATH, topic);
+    std::deque<std::string>& que = upload_queues[topic];
+    pthread_mutex_t& mtx = upload_mutexes[topic];
+    std::string files[POP_NUM];
 
-    DIR *dp = opendir(path);
-    if (dp == NULL) {
-        write_log(app_log_path, LOG_ERR, "opendir[%s] failed with errno[%d]",
-                  path, errno);
-        write_log(app_log_path, LOG_ERR, "thread copy_to_hdfs exiting");
-        return (void *)-1;
-    }
+    do {
+        int num = 0;
 
-    size_t el = offsetof(struct dirent, d_name) + 64;
-    struct dirent *dep = (struct dirent *)malloc(el);
-    if (dep == NULL) {
-        write_log(app_log_path, LOG_ERR, "malloc failed");
-        closedir(dp);
-        write_log(app_log_path, LOG_ERR, "thread copy_to_hdfs exiting");
-        return (void *)-1;
-    }
-
-    struct dirent *res;
-    while (readdir_r(dp, dep, &res) == 0) {
-        if (res == NULL) {
-            sleep(70);
-            rewinddir(dp);
-            continue;
+        // XXX
+        pthread_mutex_lock(&mtx);
+        while (!que.empty()) {
+            files[num++].assign(que.front());
+            que.pop_front();
+            if (num == POP_NUM) break;
         }
-        if (strcmp(dep->d_name, ".") == 0 || strcmp(dep->d_name, "..") == 0) {
-            continue;
-        }
-        if (strcmp(topic, "bid") == 0 || strcmp(topic, "unbid") == 0) {
-            char *p = strrchr(dep->d_name, '.');
-            if (strncmp(p + 1, "lzo", 3) != 0) continue;
-            snprintf(path + n, sizeof(path) - n, "/%s", dep->d_name);
-            if (copy_ex(topic, path) == 0) rm_local(path);
-        } else {
-            snprintf(path + n, sizeof(path) - n, "/%s", dep->d_name);
-            if (!is_write_finished(path, topic)) continue;
-            if (copy(topic, path) == 0 || copy_ex(topic, path, false) == 0) {
-                rm_local(path);
-                cleanup_fp(path);
+        pthread_mutex_unlock(&mtx);
+
+        for (int i = 0; i < num; i++) {
+            const char *f = files[i].c_str();
+            if (strcmp(topic, "bid") == 0 || strcmp(topic, "unbid") == 0) {
+                if (copy_ex(topic, f) == 0) rm_local(f);
+            } else {
+                if (copy(topic, f) == 0
+                    || copy_ex(topic, f, false) == 0) {
+                    rm_local(f);
+                }
             }
         }
-    }
-    write_log(app_log_path, LOG_ERR,
-              "readdir_r for topic[%s] to upload failed", topic);
+    } while (true);
 
-    free(dep);
-    closedir(dp);
-    write_log(app_log_path, LOG_ERR, "thread copy_to_hdfs exiting");
-
-    return (void *)0;
+    write_log(app_log_path, LOG_ERR, "thread copy_to_hdfs"
+              " for topic[%s] exiting unexpected", topic);
+    return (void *)-1;
 }
 
 static void set_timezone()
@@ -1357,8 +1455,34 @@ for (std::map<std::string, int>::const_iterator it =
             }
         }
 
+        upload_queues[topics[i]] = std::deque<std::string>();
+        if ((ret = pthread_mutex_init(&upload_mutexes[topics[i]], NULL)) != 0) {
+            write_log(app_log_path, LOG_ERR, "pthread_mutex_init for topic[%s]"
+                      " failed with errno[%d]", topics[i], ret);
+            clear_fp_cache();
+            destroy_topics();
+            free_consumer();
+            free(thrs);
+            free_topics_partnos();
+            exit(EXIT_FAILURE);
+        }
+
         pthread_t thr2;
-        ret = pthread_create(&thr2, NULL, copy_to_hdfs, (void *)topics[i]);
+        ret = pthread_create(&thr2, NULL, enqueue_upload_files,
+                             (void *)topics[i]);
+        if (ret != 0) {
+            write_log(app_log_path, LOG_ERR, "pthread_create["
+                      "enqueue_upload_files] failed with errno[%d]", errno);
+            clear_fp_cache();
+            destroy_topics();
+            free_consumer();
+            free(thrs);
+            free_topics_partnos();
+            exit(EXIT_FAILURE);
+        }
+
+        pthread_t thr3;
+        ret = pthread_create(&thr3, NULL, copy_to_hdfs, (void *)topics[i]);
         if (ret != 0) {
             write_log(app_log_path, LOG_ERR, "pthread_create[copy_to_hdfs]"
                       " failed with errno[%d]", errno);
