@@ -393,7 +393,7 @@ static FILE *retrieve_fp(const char *filename)
     if (it == fp_cache.end()) {
         pthread_rwlock_unlock(&fp_lock);
         pthread_rwlock_wrlock(&fp_lock);
-        // XXX try finding it again before openning?
+        // XXX try finding it again before opening?
         if ((fp = fopen(filename, "a")) == NULL) {
             write_log(app_log_path, LOG_ERR, "fopen[%s] for writing raw logs"
                       " failed with errno[%d]", filename, errno);
@@ -582,8 +582,16 @@ static bool write_raw_file(const char *topic, const char *payload, size_t len)
         n = fwrite(payload, 1, len, fp);
     }
     if (count == 3) {
-        write_log(app_log_path, LOG_ERR, "fwrite[%s] failed", loc_path);
-        return false;
+        write_log(app_log_path, LOG_WARNING, "fwrite[%s] might fail", loc_path);
+        if ((fp = retrieve_fp(loc_path)) == NULL) {
+            write_log(app_log_path, LOG_ERR,
+                      "retrieve_fp[%s] failed", loc_path);
+            return false;
+        }
+        if ((n = fwrite(payload, 1, len, fp)) != len) {
+            write_log(app_log_path, LOG_ERR, "fwrite[%s] failed", loc_path);
+            return false;
+        }
     }
     fputc('\n', fp);
 
@@ -746,7 +754,7 @@ static int lzo_compress(const char *in_path)
     return wrap_system(cmd);
 }
 
-#define MAX_FILE_SIZE 6442450944 // 6G
+#define MAX_FILE_SIZE 8589934592 // 8G
 
 // only bid and unbid need to be compressed
 static void *compress_files(void *arg)
