@@ -83,6 +83,7 @@ static int64_t start_offset = KAFKA_OFFSET_STORED;
 static std::map<std::string, std::deque<std::string> > upload_queues;
 static std::map<std::string, pthread_mutex_t> upload_mutexes;
 
+// TODO optimaztion needed
 static bool align_YmdHM(char *YmdHM, int interval)
 {
     if (strlen(YmdHM) != 12) return false;
@@ -393,18 +394,21 @@ static FILE *retrieve_fp(const char *filename)
     if (it == fp_cache.end()) {
         pthread_rwlock_unlock(&fp_lock);
         pthread_rwlock_wrlock(&fp_lock);
-        // XXX try finding it again before opening?
-        if ((fp = fopen(filename, "a")) == NULL) {
-            write_log(app_log_path, LOG_ERR, "fopen[%s] for writing raw logs"
-                      " failed with errno[%d]", filename, errno);
+        if ((it = fp_cache.find(bn)) != fp_cache.end()) {
+            fp = it->second;
         } else {
-            std::pair<std::map<std::string, FILE *>::iterator, bool> ret;
-            ret = fp_cache.insert(std::pair<std::string, FILE *>(bn, fp));
-            if (!ret.second) {
-                write_log(app_log_path, LOG_WARNING,
-                          "repeated FP[%s]", filename);
-                fclose(fp);
-                fp = ret.first->second;
+            if ((fp = fopen(filename, "a")) == NULL) {
+                write_log(app_log_path, LOG_ERR, "fopen[%s] for writing raw logs"
+                          " failed with errno[%d]", filename, errno);
+            } else {
+                std::pair<std::map<std::string, FILE *>::iterator, bool> ret;
+                ret = fp_cache.insert(std::pair<std::string, FILE *>(bn, fp));
+                if (!ret.second) {
+                    write_log(app_log_path, LOG_WARNING,
+                              "repeated FP[%s]", filename);
+                    fclose(fp);
+                    fp = ret.first->second;
+                }
             }
         }
     } else {
@@ -1251,11 +1255,11 @@ static void *enqueue_upload_files(void *arg)
             }
             free(dep);
         }
+        free(namelist);
 
         sleep(70);
     } while (true);
 
-    free(namelist);
     write_log(app_log_path, LOG_ERR, "thread copy_to_hdfs"
               " for topic[%s] exiting", topic);
 
@@ -1328,6 +1332,68 @@ static void sa_callback(int signum, siginfo_t *si, void *uc)
              si->si_errno, si->si_code, si->si_pid, si->si_status, si->si_addr);
 }
 #endif
+
+static void destroy_upload_mutexes()
+{
+    for (std::map<std::string, pthread_mutex_t>::iterator it =
+         upload_mutexes.begin(); it != upload_mutexes.end(); it++) {
+        pthread_mutex_destroy(&it->second);
+    }
+}
+
+static bool init_upload_queue_mutexes()
+{
+    for (int i = 0; i < topic_total; i++) {
+        pthread_mutex_t mtx;
+        int ret = pthread_mutex_init(&mtx, NULL);
+        if (ret != 0) {
+            write_log(app_log_path, LOG_ERR, "pthread_mutex_init for topic[%s]"
+                      " failed with errno[%d]", topics[i], ret);
+            return false;
+        }
+        upload_mutexes[topics[i]] = mtx;
+        upload_queues[topics[i]] = std::deque<std::string>();
+    }
+    return true;
+}
+
+static int remedy()
+{
+    char path[sizeof(UPLOAD_PATH) + 128];
+    int n = snprintf(path, sizeof(path), "%s%s", CWD_ROOT, UPLOAD_PATH);
+    if (n < 0) {
+        write_log(app_log_path, LOG_ERR, "snprintf failed");
+        return -1;
+    }
+
+    int total = 0;
+    struct dirent **namelist = NULL;
+    for (int i = 0; i < topic_total; i++) {
+        int m = snprintf(path + n, sizeof(path) - n , "/%s", topics[i]);
+
+        int num = scandir(path, &namelist, scandir_filter, scandir_compar);
+        if (num == -1) {
+            write_log(app_log_path, LOG_ERR, "scandir[%s] failed"
+                      " with errno[%d]", path, errno);
+            continue;
+        }
+
+        std::deque<std::string>& que = upload_queues[topics[i]];
+
+        for (int i = 0; i < num; i++) {
+            struct dirent *dep = namelist[i];
+            snprintf(path + n + m, sizeof(path) - n - m, "/%s", dep->d_name);
+            write_log(app_log_path, LOG_INFO, "remedy[%s]", path);
+            que.push_back(path);
+            total++;
+            free(dep);
+        }
+
+        free(namelist);
+    }
+
+    return total;
+}
 
 int main(int argc, char *argv[])
 {
@@ -1431,8 +1497,18 @@ for (std::map<std::string, int>::const_iterator it =
         exit(EXIT_FAILURE);
     }
 
-    int n = 0, ret;
+    if (!init_upload_queue_mutexes()) {
+        destroy_topics();
+        free_consumer();
+        free(thrs);
+        free_topics_partnos();
+        exit(EXIT_FAILURE);
+    }
 
+    int n = remedy(), ret;
+    write_log(app_log_path, LOG_INFO, "%d files remedy", n);
+
+    n = 0;
     for (int i = 0; i < topic_total; i++) {
         for (int j = 0; j < partnos[i]; j++) {
             ThrArg *arg = new ThrArg(kcts[i], j);
@@ -1466,18 +1542,6 @@ for (std::map<std::string, int>::const_iterator it =
                 free_topics_partnos();
                 exit(EXIT_FAILURE);
             }
-        }
-
-        upload_queues[topics[i]] = std::deque<std::string>();
-        if ((ret = pthread_mutex_init(&upload_mutexes[topics[i]], NULL)) != 0) {
-            write_log(app_log_path, LOG_ERR, "pthread_mutex_init for topic[%s]"
-                      " failed with errno[%d]", topics[i], ret);
-            clear_fp_cache();
-            destroy_topics();
-            free_consumer();
-            free(thrs);
-            free_topics_partnos();
-            exit(EXIT_FAILURE);
         }
 
         pthread_t thr2;
