@@ -35,6 +35,11 @@ extern "C" {
 #include <deque>
 #include <sstream>
 
+#if 0
+#include "orc/orc-config.hh"
+#include "orc/ColumnPrinter.hh"
+#endif
+
 #define CWD_ROOT "/data/users/data-infra/kafka2hdfs/"
 
 class ThrArg {
@@ -434,16 +439,21 @@ static void cleanup_fp(const char *filename)
         return;
     }
 
+    FILE *fp = NULL;
+
     pthread_rwlock_wrlock(&fp_lock);
     std::map<std::string, FILE *>::iterator it = fp_cache.find(bn);
     if (it == fp_cache.end()) {
         write_log(app_log_path, LOG_WARNING,
                   "invalid key[%s] for fp_cache", bn.c_str());
     } else {
-        fclose(it->second);
         fp_cache.erase(it);
     }
     pthread_rwlock_unlock(&fp_lock);
+
+    if (fp != NULL) {
+        fclose(fp);
+    }
 }
 
 static void clear_fp_cache()
@@ -576,28 +586,28 @@ static bool write_raw_file(const char *topic, const char *payload, size_t len)
         return false;
     }
 
-    int count = 0;
-    size_t n = fwrite(payload, 1, len, fp);
-    while (n != len) {
-        if (++count == 3) break;
-        delay_simply(500 * count);
-        len -= n;
-        payload += n;
-        n = fwrite(payload, 1, len, fp);
-    }
-    if (count == 3) {
-        write_log(app_log_path, LOG_WARNING, "fwrite[%s] might fail", loc_path);
+    // XXX
+    char temp[len + 1];
+    memcpy(temp, payload, len);
+    temp[len] = '\n';
+
+    size_t n = fwrite(temp, 1, len + 1, fp);
+    if (n != len + 1) {
+        write_log(app_log_path, LOG_WARNING, "fwrite[%s] might fail: "
+                  "written[%lu] expected[%lu]", loc_path, n, len + 1);
         if ((fp = retrieve_fp(loc_path)) == NULL) {
             write_log(app_log_path, LOG_ERR,
                       "retrieve_fp[%s] failed", loc_path);
             return false;
         }
-        if ((n = fwrite(payload, 1, len, fp)) != len) {
-            write_log(app_log_path, LOG_ERR, "fwrite[%s] failed", loc_path);
+        // XXX non-atomic
+        size_t n2 = fwrite(temp + n, 1, len + 1 - n, fp);
+        if (n2 != len + 1 - n) {
+            write_log(app_log_path, LOG_ERR, "fwrite[%s] failed: "
+                      "written[%lu] expected[%lu]", loc_path, n2, len + 1 - n);
             return false;
         }
     }
-    fputc('\n', fp);
 
     return true;
 }
@@ -752,13 +762,27 @@ static int wrap_system(const char *cmd, bool logged = true)
 static int lzo_compress(const char *in_path)
 {
     char cmd[256];
-    //snprintf(cmd, sizeof(cmd), "%s %s &", LZOP, in_path);
+    //snprintf(cmd, sizeof(cmd), "%s %s", LZOP, in_path);
     snprintf(cmd, sizeof(cmd), "%s %s &", LZOP, in_path);
     write_log(app_log_path, LOG_INFO, "DEBUG exec-ing cmd[%s]", cmd);
     return wrap_system(cmd);
 }
 
-#define MAX_FILE_SIZE 8589934592 // 8G
+#define MAX_FILE_SIZE 7516192768 // 7G
+
+static int scandir_filter_2(const struct dirent *dep)
+{
+    if (strcmp(dep->d_name, ".") == 0 || strcmp(dep->d_name, "..") == 0) {
+        return 0;
+    }
+    const char *p = strrchr(dep->d_name, '.') + 1;
+    return strncmp(p, "seq", 3) == 0 ? 1 : 0;
+}
+
+static int scandir_compar_2(const struct dirent **a, const struct dirent **b)
+{
+    return strcmp((*a)->d_name, (*b)->d_name);
+}
 
 // only bid and unbid need to be compressed
 static void *compress_files(void *arg)
@@ -793,41 +817,25 @@ static void *compress_files(void *arg)
                   " for topic[%s] exiting", topic);
         return (void *)-1;
     }
-
-    DIR *dp = opendir(path);
-    if (dp == NULL) {
-        write_log(app_log_path, LOG_ERR,
-                  "opendir[%s] failed with errno[%d]", path, errno);
-        write_log(app_log_path, LOG_ERR, "thread compress_files"
-                  " for topic[%s] exiting", topic);
-        return (void *)-1;
-    }
-
-    size_t el = offsetof(struct dirent, d_name) + 64;
-    struct dirent *dep = (struct dirent *)malloc(el);
-    if (dep == NULL) {
-        write_log(app_log_path, LOG_ERR, "malloc failed");
-        closedir(dp);
-        write_log(app_log_path, LOG_ERR, "thread compress_files"
-                  " for topic[%s] exiting", topic);
-        return (void *)-1;
-    }
-
     memcpy(path2, path, n);
 
-    struct dirent *res;
-    while (readdir_r(dp, dep, &res) == 0) {
-        if (res == NULL) {
-            sleep(70);
-            rewinddir(dp);
-            continue;
+    struct dirent **namelist = NULL;
+
+    do {
+        path[n] = '\0';
+
+        int num = scandir(path, &namelist, scandir_filter_2, scandir_compar_2);
+        if (num == -1) {
+            write_log(app_log_path, LOG_ERR, "scandir[%s] failed"
+                      " with errno[%d]", path, errno);
         }
-        if (strcmp(dep->d_name, ".") == 0 || strcmp(dep->d_name, "..") == 0) {
-            continue;
-        }
-        char *p = strrchr(dep->d_name, '.') + 1;
-        if (strncmp(p, "seq", 3) == 0) {
-            snprintf(path + n, sizeof(path) - n, "/%s", dep->d_name);
+        for (int i = 0; i < num; i++) {
+            struct dirent *dep = namelist[i];
+            if (snprintf(path + n, sizeof(path) - n, "/%s", dep->d_name) < 0) {
+                free(dep);
+                continue;
+            }
+
             if (is_write_finished(path)) {
                 snprintf(path2 + n, sizeof(path2) - n, "/%s.0", dep->d_name);
                 write_log(app_log_path, LOG_INFO,
@@ -837,24 +845,27 @@ static void *compress_files(void *arg)
                          dep->d_name, time(NULL));
                 write_log(app_log_path, LOG_INFO, "DEBUG path[%s] too large", path2);
             } else {
+                free(dep);
                 continue;
             }
             // XXX
             if (rename(path, path2) != 0) {
                 write_log(app_log_path, LOG_ERR, "rename[%s to %s] failed"
                           " with errno[%d]", path, path2, errno);
+                free(dep);
                 continue;
             }
             cleanup_fp(path);
             // TODO non-blocking exit code
             lzo_compress(path2);
-        }
-    }
-    write_log(app_log_path, LOG_ERR,
-              "readdir_r for topic[%s] to compress failed", topic);
 
-    free(dep);
-    closedir(dp);
+            free(dep);
+        }
+        free(namelist);
+
+        sleep(70);
+    } while (true);
+
     write_log(app_log_path, LOG_ERR, "thread compress_files"
               " for topic[%s] exiting", topic);
 
@@ -1141,13 +1152,14 @@ static int copy_ex(const char *topic, const char *zfile, bool indexed = true)
     snprintf(cmd, sizeof(cmd), "hadoop fs -test -e %s", hdfs_path);
     if (wrap_system(cmd, false) != 0) {
         if (hdfs_put(zfile, hdfs_path) == 0) {
-write_log(app_log_path, LOG_INFO, "DEBUG hdfs_put[%s] OK", zfile);
+            write_log(app_log_path, LOG_INFO, "DEBUG hdfs_put[%s] OK", zfile);
         } else {
             return -1;
         }
     } else {
         if (hdfs_append(zfile, hdfs_path) == 0) {
-write_log(app_log_path, LOG_INFO, "DEBUG hdfs_append[%s] OK", zfile);
+            write_log(app_log_path, LOG_INFO,
+                      "DEBUG hdfs_append[%s] OK", zfile);
         } else {
             return -1;
         }
@@ -1192,6 +1204,51 @@ static int scandir_compar(const struct dirent **a, const struct dirent **b)
     }
 }
 
+#if 0
+static bool generate_orc_file(const char *src, const orc::ReaderOptions opts,
+                              const char *dest)
+{
+    FILE *fp = fopen(dest, "a");
+    if (fp == NULL) {
+        write_log(app_log_path, LOG_ERR,
+                  "fopen[%s] failed with errno[%d]", dest, errno);
+        return false;
+    }
+
+    std::unique_ptr<orc::Reader> reader;
+    try {
+        orc::createReader(orc::readLocalFile(std::string(filename)), opts);
+    } catch (std::exception& e) {
+        write_log(app_log_path, LOG_ERR,
+                  "createReader failed with exception[%s]", e.what());
+        return false;
+    }
+
+    std::unique_ptr<orc::ColumnVectorBatch> batch =
+        reader->createRowBatch(1000);
+    std::string line;
+    std::unique_ptr<orc::ColumnPrinter> printer =
+        createColumnPrinter(line, &reader->getSelectedType());
+
+    while (reader->next(*batch)) {
+        printer->reset(*batch);
+        for (unsigned long i = 0; i < batch->numElements; i++) {
+            line.clear();
+            printer->printRow(i);
+            line += "\n";
+            if (fwrite(line.c_str(), 1, line.length(), fp) != line.length()) {
+                write_log(app_log_path, LOG_ERR, "fwrite[%s] failed", dest);
+                fclose(fp);
+                return false;
+            }
+        }
+    }
+
+    fclose(fp);
+    return true;
+}
+#endif
+
 static void *enqueue_upload_files(void *arg)
 {
     char *topic = (char *)arg;
@@ -1217,7 +1274,7 @@ static void *enqueue_upload_files(void *arg)
         return (void *)-1;
     }
 
-    char path2[sizeof(RAW_LOG_PATH) + 128];
+    char path2[sizeof(RAW_LOG_PATH) + 128], path3[sizeof(RAW_LOG_PATH) + 128];
     struct dirent **namelist = NULL;
     std::deque<std::string>& que = upload_queues[topic];
     pthread_mutex_t& mtx = upload_mutexes[topic];
@@ -1233,23 +1290,35 @@ static void *enqueue_upload_files(void *arg)
         for (int i = 0; i < num; i++) {
             struct dirent *dep = namelist[i];
             if (snprintf(path + n, sizeof(path) - n, "/%s", dep->d_name) < 0) {
+                free(dep);
                 continue;
             }
             if (is_write_finished(path)) {
-                if (snprintf(path2, sizeof(path2), "%s%s/%s/%s",
-                             CWD_ROOT, UPLOAD_PATH, topic, dep->d_name) < 0) {
+                int n2 = snprintf(path2, sizeof(path2), "%s%s/%s/%s",
+                                  CWD_ROOT, UPLOAD_PATH, topic, dep->d_name);
+                if (n2 < 0) {
+                    free(dep);
                     continue;
                 }
                 if (rename(path, path2) != 0) {
                     write_log(app_log_path, LOG_ERR, "rename[%s:%s] failed"
                               " with errno[%d]", path, path2, errno);
                 } else {
+                    bool orc_ok = false;
                     if (strcmp(topic, "bid") != 0
                         && strcmp(topic, "unbid") != 0) {
                         cleanup_fp(path);
+                        strncpy(path3, path2, n2 - 3);
+                        path3[n2 - 3] = 'o';
+                        path3[n2 - 2] = 'r';
+                        path3[n2 - 1] = 'c';
+                        // ORC files
+                        //orc::ReaderOptions opts;
+                        //orc_ok = generate_orc_file(path2, opts, path3);
                     }
                     pthread_mutex_lock(&mtx);
                     que.push_back(path2);
+                    if (orc_ok) que.push_back(path3);
                     pthread_mutex_unlock(&mtx);
                 }
             }
@@ -1468,7 +1537,7 @@ int main(int argc, char *argv[])
 for (std::map<std::string, int>::const_iterator it =
      upload_intervals.begin(); it != upload_intervals.end(); it++) {
     write_log(app_log_path, LOG_INFO,
-              "DEBUG topic[%s] interval[%d]\n",
+              "DEBUG topic[%s] interval[%d]",
               it->first.c_str(), it->second);
 }
 #endif
