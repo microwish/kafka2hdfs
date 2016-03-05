@@ -667,7 +667,7 @@ static time_t get_mtime(const char *path)
     return stbuf.st_mtime;
 }
 
-static time_t get_file_size(const char *path)
+static off_t get_file_size(const char *path)
 {
     struct stat stbuf;
     if (stat(path, &stbuf) != 0) {
@@ -705,7 +705,6 @@ static inline void rm_local(const char *f, int flag = 1)
 {
     switch (flag) {
     case 1: // delete
-        write_log(app_log_path, LOG_INFO, "DEBUG unlinking[%s]", f);
         if (unlink(f) != 0) {
             write_log(app_log_path, LOG_WARNING,
                       "unlink[%s] failed with errno[%d]", f, errno);
@@ -957,31 +956,47 @@ static bool build_hdfs_path(const char *topic, const char *bn, char *path)
     return true;
 }
 
+#define HADOOP_LZO_INDEX "hadoop jar /usr/lib/hadoop/lib/" \
+    "hadoop-lzo-0.4.19.jar com.hadoop.compression.lzo.LzoIndexer"
+
 #define HDFS_PUT "hadoop fs -put"
 
 // TODO for large files to be uploaded
 // should be implemented using libhdfs directly
 // referring Impala
-static int hdfs_put(const char *loc_path, const char *hdfs_path)
+static int hdfs_put(const char *loc_path, const char *hdfs_path,
+                    bool indexed = false)
 {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "%s %s %s", HDFS_PUT, loc_path, hdfs_path);
+    char cmd[512];
+    if (!indexed) {
+        snprintf(cmd, sizeof(cmd), "%s %s %s && rm %s &",
+                 HDFS_PUT, loc_path, hdfs_path, loc_path);
+    } else {
+        snprintf(cmd, sizeof(cmd), "%s %s %s && rm %s && %s %s &",
+                 HDFS_PUT, loc_path, hdfs_path, loc_path,
+                 HADOOP_LZO_INDEX, hdfs_path);
+    }
     write_log(app_log_path, LOG_INFO, "DEBUG exec-ing cmd[%s]", cmd);
     return wrap_system(cmd);
 }
 
 #define HDFS_APPEND "hadoop fs -appendToFile"
 
-static int hdfs_append(const char *loc_path, const char *hdfs_path)
+static int hdfs_append(const char *loc_path, const char *hdfs_path,
+                       bool indexed = false)
 {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "%s %s %s", HDFS_APPEND, loc_path, hdfs_path);
+    char cmd[512];
+    if (!indexed) {
+        snprintf(cmd, sizeof(cmd), "%s %s %s && rm %s &",
+                 HDFS_APPEND, loc_path, hdfs_path, loc_path);
+    } else {
+        snprintf(cmd, sizeof(cmd), "%s %s %s && rm %s && %s %s &",
+                 HDFS_APPEND, loc_path, hdfs_path, loc_path,
+                 HADOOP_LZO_INDEX, hdfs_path);
+    }
     write_log(app_log_path, LOG_INFO, "DEBUG exec-ing cmd[%s]", cmd);
     return wrap_system(cmd);
 }
-
-#define HADOOP_LZO_INDEX "hadoop jar /usr/lib/hadoop/lib/" \
-    "hadoop-lzo-0.4.19.jar com.hadoop.compression.lzo.LzoIndexer"
 
 static int hdfs_lzo_index(const char *hdfs_path)
 {
@@ -1007,7 +1022,7 @@ static int copy(const char *topic, const char *zfile)
     if (fs_handle == NULL) {
         write_log(app_log_path, LOG_ERR,
                   "hdfsConnect[%s:%s] failed with errno[%d]",
-                  k2h_conf["namenode"].c_str(), k2h_conf["port"].c_str(), errno);
+                 k2h_conf["namenode"].c_str(), k2h_conf["port"].c_str(), errno);
         return -1;
     }
 
@@ -1151,21 +1166,18 @@ static int copy_ex(const char *topic, const char *zfile, bool indexed = true)
 
     snprintf(cmd, sizeof(cmd), "hadoop fs -test -e %s", hdfs_path);
     if (wrap_system(cmd, false) != 0) {
-        if (hdfs_put(zfile, hdfs_path) == 0) {
+        if (hdfs_put(zfile, hdfs_path, indexed) == 0) {
             write_log(app_log_path, LOG_INFO, "DEBUG hdfs_put[%s] OK", zfile);
         } else {
             return -1;
         }
     } else {
-        if (hdfs_append(zfile, hdfs_path) == 0) {
+        if (hdfs_append(zfile, hdfs_path, indexed) == 0) {
             write_log(app_log_path, LOG_INFO,
                       "DEBUG hdfs_append[%s] OK", zfile);
         } else {
             return -1;
         }
-    }
-    if (indexed && hdfs_lzo_index(hdfs_path) == 0) {
-write_log(app_log_path, LOG_INFO, "DEBUG hdfs_lzo_index[%s] OK", hdfs_path);
     }
     return 0;
 }
@@ -1278,6 +1290,7 @@ static void *enqueue_upload_files(void *arg)
     struct dirent **namelist = NULL;
     std::deque<std::string>& que = upload_queues[topic];
     pthread_mutex_t& mtx = upload_mutexes[topic];
+    //orc::ReaderOptions opts;
 
     do {
         path[n] = '\0';
@@ -1294,6 +1307,15 @@ static void *enqueue_upload_files(void *arg)
                 continue;
             }
             if (is_write_finished(path)) {
+                long l = get_file_size(path);
+                if (l < 64) {
+                    if (l != -1) {
+                        write_log(app_log_path, LOG_WARNING,
+                                  "file[%s] too small", path);
+                        rm_local(path);
+                    }
+                    continue;
+                }
                 int n2 = snprintf(path2, sizeof(path2), "%s%s/%s/%s",
                                   CWD_ROOT, UPLOAD_PATH, topic, dep->d_name);
                 if (n2 < 0) {
@@ -1313,7 +1335,6 @@ static void *enqueue_upload_files(void *arg)
                         path3[n2 - 2] = 'r';
                         path3[n2 - 1] = 'c';
                         // ORC files
-                        //orc::ReaderOptions opts;
                         //orc_ok = generate_orc_file(path2, opts, path3);
                     }
                     pthread_mutex_lock(&mtx);
@@ -1371,11 +1392,18 @@ static void *copy_to_hdfs(void *arg)
         for (int i = 0; i < num; i++) {
             const char *f = files[i].c_str();
             if (strcmp(topic, "bid") == 0 || strcmp(topic, "unbid") == 0) {
-                if (copy_ex(topic, f) == 0) rm_local(f);
+                if (copy_ex(topic, f) != 0) {
+                    write_log(app_log_path, LOG_ERR,
+                              "copy_ex[%s] to HDFS failed", f);
+                }
             } else {
-                if (copy(topic, f) == 0
-                    || copy_ex(topic, f, false) == 0) {
+                if (copy(topic, f) == 0) {
                     rm_local(f);
+                } else {
+                    if (copy_ex(topic, f, false) != 0) {
+                        write_log(app_log_path, LOG_ERR,
+                                  "copy[%s] to HDFS failed", f);
+                    }
                 }
             }
         }
