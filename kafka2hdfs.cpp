@@ -447,12 +447,20 @@ static void cleanup_fp(const char *filename)
         write_log(app_log_path, LOG_WARNING,
                   "invalid key[%s] for fp_cache", bn.c_str());
     } else {
+        fp = it->second;
         fp_cache.erase(it);
     }
     pthread_rwlock_unlock(&fp_lock);
 
     if (fp != NULL) {
-        fclose(fp);
+        if (fclose(fp) != 0) {
+            write_log(app_log_path, LOG_ERR,
+                      "fclose[%s] failed with errno[%d]", filename, errno);
+        } else {
+            write_log(app_log_path, LOG_INFO, "DEBUG fclose[%s] OK", filename);
+        }
+    } else {
+        write_log(app_log_path, LOG_WARNING, "unexpected null FP[%s]", filename);
     }
 }
 
@@ -681,7 +689,7 @@ static off_t get_file_size(const char *path)
 #define BUFFER_MINUTES 5
 
 //static bool is_write_finished(const char *path, const char *topic)
-static bool is_write_finished(const char *path)
+static bool is_write_finished(const char *path, int minutes = BUFFER_MINUTES)
 {
     time_t mt = get_mtime(path);
     if (mt == -1) return false;
@@ -698,7 +706,7 @@ static bool is_write_finished(const char *path)
 
     // XXX how long to delay?
     // front-end machines --> Kafka --> consumer
-    return (time(NULL) - mt) > BUFFER_MINUTES * 60;
+    return (time(NULL) - mt) > minutes * 60;
 }
 
 static inline void rm_local(const char *f, int flag = 1)
@@ -708,6 +716,8 @@ static inline void rm_local(const char *f, int flag = 1)
         if (unlink(f) != 0) {
             write_log(app_log_path, LOG_WARNING,
                       "unlink[%s] failed with errno[%d]", f, errno);
+        } else {
+            write_log(app_log_path, LOG_INFO, "DEBUG unlink[%s] OK", f);
         }
         break;
     case 2: // move
@@ -969,10 +979,10 @@ static int hdfs_put(const char *loc_path, const char *hdfs_path,
 {
     char cmd[512];
     if (!indexed) {
-        snprintf(cmd, sizeof(cmd), "%s %s %s && rm %s &",
+        snprintf(cmd, sizeof(cmd), "%s %s %s && rm -f %s &",
                  HDFS_PUT, loc_path, hdfs_path, loc_path);
     } else {
-        snprintf(cmd, sizeof(cmd), "%s %s %s && rm %s && %s %s &",
+        snprintf(cmd, sizeof(cmd), "%s %s %s && rm -f %s && %s %s &",
                  HDFS_PUT, loc_path, hdfs_path, loc_path,
                  HADOOP_LZO_INDEX, hdfs_path);
     }
@@ -987,10 +997,10 @@ static int hdfs_append(const char *loc_path, const char *hdfs_path,
 {
     char cmd[512];
     if (!indexed) {
-        snprintf(cmd, sizeof(cmd), "%s %s %s && rm %s &",
+        snprintf(cmd, sizeof(cmd), "%s %s %s && rm -f %s &",
                  HDFS_APPEND, loc_path, hdfs_path, loc_path);
     } else {
-        snprintf(cmd, sizeof(cmd), "%s %s %s && rm %s && %s %s &",
+        snprintf(cmd, sizeof(cmd), "%s %s %s && rm -f %s && %s %s &",
                  HDFS_APPEND, loc_path, hdfs_path, loc_path,
                  HADOOP_LZO_INDEX, hdfs_path);
     }
@@ -1286,6 +1296,8 @@ static void *enqueue_upload_files(void *arg)
         return (void *)-1;
     }
 
+    bool bid_related = strcmp(topic, "unbid") == 0 || strcmp(topic, "bid") == 0;
+    int buffer_minutes = bid_related ? 1 : BUFFER_MINUTES;
     char path2[sizeof(RAW_LOG_PATH) + 128], path3[sizeof(RAW_LOG_PATH) + 128];
     struct dirent **namelist = NULL;
     std::deque<std::string>& que = upload_queues[topic];
@@ -1306,14 +1318,16 @@ static void *enqueue_upload_files(void *arg)
                 free(dep);
                 continue;
             }
-            if (is_write_finished(path)) {
+            if (is_write_finished(path, buffer_minutes)) {
                 long l = get_file_size(path);
                 if (l < 64) {
                     if (l != -1) {
                         write_log(app_log_path, LOG_WARNING,
                                   "file[%s] too small", path);
+                        if (!bid_related) cleanup_fp(path);
                         rm_local(path);
                     }
+                    free(dep);
                     continue;
                 }
                 int n2 = snprintf(path2, sizeof(path2), "%s%s/%s/%s",
@@ -1327,8 +1341,7 @@ static void *enqueue_upload_files(void *arg)
                               " with errno[%d]", path, path2, errno);
                 } else {
                     bool orc_ok = false;
-                    if (strcmp(topic, "bid") != 0
-                        && strcmp(topic, "unbid") != 0) {
+                    if (!bid_related) {
                         cleanup_fp(path);
                         strncpy(path3, path2, n2 - 3);
                         path3[n2 - 3] = 'o';
@@ -1373,6 +1386,7 @@ static void *copy_to_hdfs(void *arg)
         return (void *)-1;
     }
 
+    bool bid_related = strcmp(topic, "bid") == 0 || strcmp(topic, "unbid") == 0;
     std::deque<std::string>& que = upload_queues[topic];
     pthread_mutex_t& mtx = upload_mutexes[topic];
     std::string files[POP_NUM];
@@ -1391,7 +1405,7 @@ static void *copy_to_hdfs(void *arg)
 
         for (int i = 0; i < num; i++) {
             const char *f = files[i].c_str();
-            if (strcmp(topic, "bid") == 0 || strcmp(topic, "unbid") == 0) {
+            if (bid_related) {
                 if (copy_ex(topic, f) != 0) {
                     write_log(app_log_path, LOG_ERR,
                               "copy_ex[%s] to HDFS failed", f);
