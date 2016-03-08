@@ -127,7 +127,7 @@ static bool align_YmdHM(char *YmdHM, int interval)
     long rem = t % (interval * 60);
     if (rem == 0) return true;
 
-    t += interval * 60 - rem;
+    t += interval * 60 - rem - 2;
     if (localtime_r(&t, &r) == NULL) return false;
     snprintf(YmdHM, 13, "%d%02d%02d%02d%02d",
              r.tm_year + 1900, r.tm_mon + 1, r.tm_mday, r.tm_hour, r.tm_min);
@@ -975,17 +975,23 @@ static bool build_hdfs_path(const char *topic, const char *bn, char *path)
 // should be implemented using libhdfs directly
 // referring Impala
 static int hdfs_put(const char *loc_path, const char *hdfs_path,
-                    bool indexed = false)
+                    bool deleted = true, bool indexed = false)
 {
     char cmd[512];
-    if (!indexed) {
-        snprintf(cmd, sizeof(cmd), "%s %s %s && rm -f %s &",
-                 HDFS_PUT, loc_path, hdfs_path, loc_path);
-    } else {
-        snprintf(cmd, sizeof(cmd), "%s %s %s && rm -f %s && %s %s &",
-                 HDFS_PUT, loc_path, hdfs_path, loc_path,
-                 HADOOP_LZO_INDEX, hdfs_path);
+    int n, n2;
+
+    n = snprintf(cmd, sizeof(cmd), "%s %s %s", HDFS_PUT, loc_path, hdfs_path);
+    if (deleted) {
+        n2 = snprintf(cmd + n, sizeof(cmd) - n, " && rm -f %s", loc_path);
+        n += n2;
     }
+    if (indexed) {
+        n2 = snprintf(cmd + n, sizeof(cmd) - n, " && %s %s",
+                      HADOOP_LZO_INDEX, hdfs_path);
+        n += n2;
+    }
+    snprintf(cmd + n, sizeof(cmd) - n, " &");
+
     write_log(app_log_path, LOG_INFO, "DEBUG exec-ing cmd[%s]", cmd);
     return wrap_system(cmd);
 }
@@ -993,17 +999,24 @@ static int hdfs_put(const char *loc_path, const char *hdfs_path,
 #define HDFS_APPEND "hadoop fs -appendToFile"
 
 static int hdfs_append(const char *loc_path, const char *hdfs_path,
-                       bool indexed = false)
+                       bool deleted = true, bool indexed = false)
 {
     char cmd[512];
-    if (!indexed) {
-        snprintf(cmd, sizeof(cmd), "%s %s %s && rm -f %s &",
-                 HDFS_APPEND, loc_path, hdfs_path, loc_path);
-    } else {
-        snprintf(cmd, sizeof(cmd), "%s %s %s && rm -f %s && %s %s &",
-                 HDFS_APPEND, loc_path, hdfs_path, loc_path,
-                 HADOOP_LZO_INDEX, hdfs_path);
+    int n, n2;
+
+    n = snprintf(cmd, sizeof(cmd), "%s %s %s",
+                 HDFS_APPEND, loc_path, hdfs_path);
+    if (deleted) {
+        n2 = snprintf(cmd + n, sizeof(cmd) - n, " && rm -f %s", loc_path);
+        n += n2;
     }
+    if (indexed) {
+        n2 = snprintf(cmd + n, sizeof(cmd) - n, " && %s %s",
+                      HADOOP_LZO_INDEX, hdfs_path);
+        n += n2;
+    }
+    snprintf(cmd + n, sizeof(cmd) - n, " &");
+
     write_log(app_log_path, LOG_INFO, "DEBUG exec-ing cmd[%s]", cmd);
     return wrap_system(cmd);
 }
@@ -1058,7 +1071,7 @@ static int copy(const char *topic, const char *zfile)
         }
         *p = '/';
         if (existing) {
-            if (hdfs_append(zfile, hdfs_path) == 0) {
+            if (hdfs_append(zfile, hdfs_path, false) == 0) {
                 write_log(app_log_path, LOG_INFO,
                           "DEBUG hdfs_append[%s] OK", zfile);
                 return 0;
@@ -1066,7 +1079,7 @@ static int copy(const char *topic, const char *zfile)
                 return -1;
             }
         } else {
-            if (hdfs_put(zfile, hdfs_path) == 0) {
+            if (hdfs_put(zfile, hdfs_path, false) == 0) {
                 write_log(app_log_path, LOG_INFO,
                           "DEBUG hdfs_put[%s] OK", zfile);
                 return 0;
@@ -1176,13 +1189,13 @@ static int copy_ex(const char *topic, const char *zfile, bool indexed = true)
 
     snprintf(cmd, sizeof(cmd), "hadoop fs -test -e %s", hdfs_path);
     if (wrap_system(cmd, false) != 0) {
-        if (hdfs_put(zfile, hdfs_path, indexed) == 0) {
+        if (hdfs_put(zfile, hdfs_path, true, indexed) == 0) {
             write_log(app_log_path, LOG_INFO, "DEBUG hdfs_put[%s] OK", zfile);
         } else {
             return -1;
         }
     } else {
-        if (hdfs_append(zfile, hdfs_path, indexed) == 0) {
+        if (hdfs_append(zfile, hdfs_path, true, indexed) == 0) {
             write_log(app_log_path, LOG_INFO,
                       "DEBUG hdfs_append[%s] OK", zfile);
         } else {
