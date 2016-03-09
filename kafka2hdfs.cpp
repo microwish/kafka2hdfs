@@ -1333,12 +1333,13 @@ static void *enqueue_upload_files(void *arg)
                 continue;
             }
             if (is_write_finished(path, buffer_minutes)) {
+                // XXX
+                if (!bid_related) cleanup_fp(path);
                 long l = get_file_size(path);
                 if (l < 64) {
                     if (l != -1) {
                         write_log(app_log_path, LOG_WARNING,
-                                  "file[%s] too small", path);
-                        if (!bid_related) cleanup_fp(path);
+                                  "file[%s:%ld] too small", path, l);
                         rm_local(path);
                     }
                     free(dep);
@@ -1356,7 +1357,6 @@ static void *enqueue_upload_files(void *arg)
                 } else {
                     bool orc_ok = false;
                     if (!bid_related) {
-                        cleanup_fp(path);
                         strncpy(path3, path2, n2 - 3);
                         path3[n2 - 3] = 'o';
                         path3[n2 - 2] = 'r';
