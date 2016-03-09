@@ -1071,7 +1071,7 @@ static int copy(const char *topic, const char *zfile)
         }
         *p = '/';
         if (existing) {
-            if (hdfs_append(zfile, hdfs_path, false) == 0) {
+            if (hdfs_append(zfile, hdfs_path) == 0) {
                 write_log(app_log_path, LOG_INFO,
                           "DEBUG hdfs_append[%s] OK", zfile);
                 return 0;
@@ -1079,7 +1079,7 @@ static int copy(const char *topic, const char *zfile)
                 return -1;
             }
         } else {
-            if (hdfs_put(zfile, hdfs_path, false) == 0) {
+            if (hdfs_put(zfile, hdfs_path) == 0) {
                 write_log(app_log_path, LOG_INFO,
                           "DEBUG hdfs_put[%s] OK", zfile);
                 return 0;
@@ -1164,6 +1164,7 @@ rtn:
     free(buf);
     fclose(fp);
     hdfsCloseFile(fs_handle, file_handle);
+    if (ret == 0) rm_local(zfile);
     return ret;
 }
 
@@ -1252,7 +1253,7 @@ static bool generate_orc_file(const char *src, const orc::ReaderOptions opts,
 
     std::unique_ptr<orc::Reader> reader;
     try {
-        orc::createReader(orc::readLocalFile(std::string(filename)), opts);
+        orc::createReader(orc::readLocalFile(std::string(src)), opts);
     } catch (std::exception& e) {
         write_log(app_log_path, LOG_ERR,
                   "createReader failed with exception[%s]", e.what());
@@ -1424,9 +1425,7 @@ static void *copy_to_hdfs(void *arg)
                               "copy_ex[%s] to HDFS failed", f);
                 }
             } else {
-                if (copy(topic, f) == 0) {
-                    rm_local(f);
-                } else {
+                if (copy(topic, f) != 0) {
                     if (copy_ex(topic, f, false) != 0) {
                         write_log(app_log_path, LOG_ERR,
                                   "copy[%s] to HDFS failed", f);
