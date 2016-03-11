@@ -1023,7 +1023,7 @@ static int hdfs_append(const char *loc_path, const char *hdfs_path,
 
 static int hdfs_lzo_index(const char *hdfs_path)
 {
-    char cmd[256];
+    char cmd[512];
     //snprintf(cmd, sizeof(cmd), "%s %s", HADOOP_LZO_INDEX, hdfs_path);
     snprintf(cmd, sizeof(cmd), "%s %s &", HADOOP_LZO_INDEX, hdfs_path);
     write_log(app_log_path, LOG_INFO, "DEBUG exec-ing cmd[%s]", cmd);
@@ -1285,6 +1285,15 @@ static bool generate_orc_file(const char *src, const orc::ReaderOptions opts,
 }
 #endif
 
+static bool file_exists(const char *path)
+{
+    struct stat stbuf;
+    if (stat(path, &stbuf) != 0) {
+        return errno != ENOENT;
+    }
+    return true;
+}
+
 static void *enqueue_upload_files(void *arg)
 {
     char *topic = (char *)arg;
@@ -1348,8 +1357,19 @@ static void *enqueue_upload_files(void *arg)
                 int n2 = snprintf(path2, sizeof(path2), "%s%s/%s/%s",
                                   CWD_ROOT, UPLOAD_PATH, topic, dep->d_name);
                 if (n2 < 0) {
+                    write_log(app_log_path, LOG_ERR,
+                              "snprintf[%s] to rename failed", dep->d_name);
                     free(dep);
                     continue;
+                }
+                char *p, suffix = 'a';
+                while (file_exists(path2)) {
+                    if (suffix == 'a') {
+                        p = strrchr(path2, '.');
+                        memmove(p + 1, p, strlen(p));
+                    }
+                    *p = suffix;
+                    suffix++;
                 }
                 if (rename(path, path2) != 0) {
                     write_log(app_log_path, LOG_ERR, "rename[%s:%s] failed"
