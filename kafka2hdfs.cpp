@@ -76,6 +76,47 @@ static const char *hdfs_path_selfmedia = "/user/data-infra/selfmedia";
 static const char *hdfs_path_logAccess = "/user/data-infra/log_access";
 static const char *hdfs_path_3rdStats = "/user/data-infra/3th_stats";
 static const char *hdfs_path_rc = "/user/data-infra/rc";
+static const char *hdfs_path_cmReachmax = "/user/data-infra/cm_reachmax";
+static const char *hdfs_path_cm_acxiom =
+    "/user/data-infra/cookie_mapping/acxiom";
+static const char *hdfs_path_cm_adchina =
+    "/user/data-infra/cookie_mapping/adchina";
+static const char *hdfs_path_cm_admaster =
+    "/user/data-infra/cookie_mapping/admaster";
+static const char *hdfs_path_cm_ap = "/user/data-infra/cookie_mapping/ap";
+static const char *hdfs_path_cm_bfd = "/user/data-infra/cookie_mapping/bfd";
+static const char *hdfs_path_cm_bshare =
+    "/user/data-infra/cookie_mapping/bshare";
+static const char *hdfs_path_cm_cmadv = "/user/data-infra/cookie_mapping/cmadv";
+static const char *hdfs_path_cm_dmpmz = "/user/data-infra/cookie_mapping/dmpmz";
+static const char *hdfs_path_cm_fingerprint =
+    "/user/data-infra/cookie_mapping/fingerprint";
+static const char *hdfs_path_cm_gzt = "/user/data-infra/cookie_mapping/gzt";
+static const char *hdfs_path_cm_hc360 = "/user/data-infra/cookie_mapping/hc360";
+static const char *hdfs_path_cm_idm = "/user/data-infra/cookie_mapping/idm";
+static const char *hdfs_path_cm_ifeng = "/user/data-infra/cookie_mapping/ifeng";
+static const char *hdfs_path_cm_iresearch =
+    "/user/data-infra/cookie_mapping/iresearch";
+static const char *hdfs_path_cm_letv = "/user/data-infra/cookie_mapping/letv";
+static const char *hdfs_path_cm_miaozhen =
+    "/user/data-infra/cookie_mapping/miaozhen";
+static const char *hdfs_path_cm_neustar =
+    "/user/data-infra/cookie_mapping/neustar";
+static const char *hdfs_path_cm_omg = "/user/data-infra/cookie_mapping/omg";
+static const char *hdfs_path_cm_reachmax =
+    "/user/data-infra/cookie_mapping/reachmax";
+static const char *hdfs_path_cm_shuyun =
+    "/user/data-infra/cookie_mapping/shuyun";
+static const char *hdfs_path_cm_stellar =
+    "/user/data-infra/cookie_mapping/stellar";
+static const char *hdfs_path_cm_suning =
+    "/user/data-infra/cookie_mapping/suning";
+static const char *hdfs_path_cm_vivaki =
+    "/user/data-infra/cookie_mapping/vivaki";
+static const char *hdfs_path_cm_xaxis = "/user/data-infra/cookie_mapping/xaxis";
+static const char *hdfs_path_cm_yhd = "/user/data-infra/cookie_mapping/yhd";
+static const char *hdfs_path_cm_yxkj = "/user/data-infra/cookie_mapping/yxkj";
+
 static std::map<const char *, const char *> topic_hdfs_map;
 
 static std::map<std::string, FILE *> fp_cache;
@@ -909,13 +950,73 @@ static void init_topic_hdfs_map()
             topic_hdfs_map[topic] = hdfs_path_3rdStats;
         } else if (strcmp(topic, "rc") == 0) {
             topic_hdfs_map[topic] = hdfs_path_rc;
+        } else if (strcmp(topic, "cm_reachmax") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cmReachmax;
+        } else if (strcmp(topic, "idm") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_idm;
+        } else if (strcmp(topic, "miaozhen") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_miaozhen;
+        } else if (strcmp(topic, "admaster") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_admaster;
+        } else if (strcmp(topic, "letv") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_letv;
+        } else if (strcmp(topic, "xaxis") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_xaxis;
+        } else if (strcmp(topic, "dmpmz") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_dmpmz;
+        } else if (strcmp(topic, "ifeng") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_ifeng;
+        } else if (strcmp(topic, "suning") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_suning;
+        } else if (strcmp(topic, "reachmax") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_reachmax;
+        } else if (strcmp(topic, "cmadv") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_cmadv;
+        } else if (strcmp(topic, "vivaki") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_vivaki;
+        } else if (strcmp(topic, "acxiom") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_acxiom;
+        } else if (strcmp(topic, "yhd") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_yhd;
+        } else if (strcmp(topic, "yxkj") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_yxkj;
+        } else if (strcmp(topic, "bfd") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_bfd;
+        } else if (strcmp(topic, "neustar") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_neustar;
+        } else if (strcmp(topic, "gzt") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_gzt;
+        } else if (strcmp(topic, "hc360") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_hc360;
+        } else if (strcmp(topic, "ap") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_ap;
+        } else if (strcmp(topic, "iresearch") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_iresearch;
+        } else if (strcmp(topic, "adchina") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_adchina;
+        } else if (strcmp(topic, "bshare") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_bshare;
+        } else if (strcmp(topic, "fingerprint") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_fingerprint;
+        } else if (strcmp(topic, "omg") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_omg;
+        } else if (strcmp(topic, "shuyun") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_shuyun;
+        } else if (strcmp(topic, "stellar") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_stellar;
         }
     }
 }
 
+// XXX underscore character in bn or topic
 static bool build_hdfs_path(const char *topic, const char *bn, char *path)
 {
-    const char *p = strchr(bn, '_');
+    const char *p;
+    if (strncmp(topic, bn, strlen(topic)) == 0) {
+        p = strchr(bn + strlen(topic), '_');
+    } else {
+        p = strchr(bn, '_');
+    }
     if (p == NULL) {
         write_log(app_log_path, LOG_ERR, "invalid filename[%s]", bn);
         return false;
@@ -930,6 +1031,7 @@ static bool build_hdfs_path(const char *topic, const char *bn, char *path)
         }
     }
 
+    // length of Ymd is 12
     if (q - p < 13) {
         write_log(app_log_path, LOG_WARNING, "truncated filename[%s]", bn);
         snprintf(path, 256, "%s/%s", hdfs_path_temp, bn);
