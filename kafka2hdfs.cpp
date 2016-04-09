@@ -113,9 +113,15 @@ static const char *hdfs_path_cm_suning =
     "/user/data-infra/cookie_mapping/suning";
 static const char *hdfs_path_cm_vivaki =
     "/user/data-infra/cookie_mapping/vivaki";
+static const char *hdfs_path_cm_annalect =
+    "/user/data-infra/cookie_mapping/annalect";
 static const char *hdfs_path_cm_xaxis = "/user/data-infra/cookie_mapping/xaxis";
 static const char *hdfs_path_cm_yhd = "/user/data-infra/cookie_mapping/yhd";
 static const char *hdfs_path_cm_yxkj = "/user/data-infra/cookie_mapping/yxkj";
+static const char *hdfs_path_pydmp_imp = "/user/data-infra/pydmp/imp";
+static const char *hdfs_path_pydmp_adv = "/user/data-infra/pydmp/adv";
+static const char *hdfs_path_pydmp_click = "/user/data-infra/pydmp/click";
+static const char *hdfs_path_pydmp_cvt = "/user/data-infra/pydmp/cvt";
 
 static std::map<const char *, const char *> topic_hdfs_map;
 
@@ -139,6 +145,8 @@ static bool align_YmdHM(char *YmdHM, int interval)
 
     r.tm_sec = 0;
     r.tm_min = atoi(YmdHM + 10);
+    // reduce small files on HDFS
+    if (r.tm_min % interval == 0) r.tm_min += 1;
 
     c = YmdHM[10];
     YmdHM[10] = '\0';
@@ -166,8 +174,12 @@ static bool align_YmdHM(char *YmdHM, int interval)
     if (t == -1) return false;
 
     long rem = t % (interval * 60);
-    if (rem == 0) return true;
+    // XXX
+    if (rem == 0) {
+        return true;
+    }
 
+    // ensure correct hours
     t += interval * 60 - rem - 2;
     if (localtime_r(&t, &r) == NULL) return false;
     snprintf(YmdHM, 13, "%d%02d%02d%02d%02d",
@@ -750,7 +762,7 @@ static bool is_write_finished(const char *path, int minutes = BUFFER_MINUTES)
     return (time(NULL) - mt) > minutes * 60;
 }
 
-static inline void rm_local(const char *f, int flag = 1)
+static inline void rm_local(const char *f, int flag = 1, const char *bu = NULL)
 {
     switch (flag) {
     case 1: // delete
@@ -818,7 +830,7 @@ static int lzo_compress(const char *in_path)
     return wrap_system(cmd);
 }
 
-#define MAX_FILE_SIZE 7516192768 // 7G
+#define MAX_FILE_SIZE 6979321856 // 6.5G
 
 static int scandir_filter_2(const struct dirent *dep)
 {
@@ -1004,6 +1016,16 @@ static void init_topic_hdfs_map()
             topic_hdfs_map[topic] = hdfs_path_cm_shuyun;
         } else if (strcmp(topic, "stellar") == 0) {
             topic_hdfs_map[topic] = hdfs_path_cm_stellar;
+        } else if (strcmp(topic, "annalect") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_cm_annalect;
+        } else if (strcmp(topic, "pydmpimp") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_pydmp_imp;
+        } else if (strcmp(topic, "pydmpadv") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_pydmp_adv;
+        } else if (strcmp(topic, "pydmpclick") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_pydmp_click;
+        } else if (strcmp(topic, "pydmpcvt") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_pydmp_cvt;
         }
     }
 }
@@ -1416,7 +1438,7 @@ static void *enqueue_upload_files(void *arg)
                      CWD_ROOT, RAW_LOG_PATH, topic);
     if (n < 0) {
         write_log(app_log_path, LOG_ERR, "snprintf failed");
-        write_log(app_log_path, LOG_ERR, "thread copy_to_hdfs"
+        write_log(app_log_path, LOG_ERR, "thread enqueue_upload_files"
                   " for topic[%s] exiting", topic);
         return (void *)-1;
     }
@@ -1505,6 +1527,70 @@ static void *enqueue_upload_files(void *arg)
     return (void *)0;
 }
 
+#define UPLOAD_BUFFER_MINUTES 20
+
+static int scandir_filter_4(const struct dirent *dep)
+{
+    if (strcmp(dep->d_name, ".") == 0 || strcmp(dep->d_name, "..") == 0) {
+        return 0;
+    }
+    struct stat stbuf;
+    if (stat(dep->d_name, &stbuf) != 0) {
+        // XXX
+        if (errno != ENOENT) {
+            write_log(app_log_path, LOG_ERR, "stat[%s] for mtime failed"
+                      " with errno[%d]", path, errno);
+        }
+        return 0;
+    }
+    return (time(NULL) - stbuf.st_mtime >= UPLOAD_BUFFER_MINUTES * 60) ? 1 : 0;
+}
+
+static int handle_delayed_upload(const char *topic)
+{
+    char cwd[128], temp[256];
+
+    // should always be /data/users/data-infra/kafka2hdfs
+    if (getcwd(cwd, sizeof(cwd)) == NULL) {
+        write_log(app_log_path, LOG_ERR, "getcwd failed with errno[%d]", errno);
+        return -1;
+    }
+    snprintf(temp, sizeof(temp), "%supload/%s", CWD_ROOT, topic);
+    if (chdir(temp) == -1) {
+        write_log(app_log_path, LOG_ERR,
+                  "chdir[%s] failed with errno[%d]", temp, errno);
+        return -1;
+    }
+
+    struct dirent **namelist = NULL;
+    int num = scandir(temp, &namelist, scandir_filter_4, scandir_compar);
+    if (num == -1) {
+        write_log(app_log_path, LOG_ERR,
+                  "scandir[%s] failed with errno[%d]", temp, errno);
+        chdir(cwd);
+        return -1;
+    } else if (num > 0) {
+        int n = snprintf(temp, sizeof(temp), "%sk2h_log/%s", CWD_ROOT, topic);
+        for (int i = 0; i < num; i++) {
+            struct dirent *dep = namelist[i];
+            snprintf(temp + n, sizeof(temp) - n, "/%s", dep->d_name);
+            rename(dep->d_name, temp);
+            write_log(app_log_path, LOG_INFO,
+                      "recovering delayed file[%s]", temp);
+            free(dep);
+        }
+    }
+    free(namelist);
+
+    if (chdir(cwd) == -1) {
+        write_log(app_log_path, LOG_ERR,
+                  "chdir[%s] failed with errno[%d]", cwd, errno);
+        return -1;
+    }
+
+    return num;
+}
+
 #define POP_NUM 2
 
 static void *copy_to_hdfs(void *arg)
@@ -1555,6 +1641,9 @@ static void *copy_to_hdfs(void *arg)
                 }
             }
         }
+
+        // XXX
+        handle_delayed_upload(topic);
     } while (true);
 
     write_log(app_log_path, LOG_ERR, "thread copy_to_hdfs"
@@ -1602,17 +1691,60 @@ static bool init_upload_queue_mutexes()
     return true;
 }
 
+static int scandir_filter_3(const struct dirent *dep)
+{
+    if (strcmp(dep->d_name, ".") == 0 || strcmp(dep->d_name, "..") == 0) {
+        return 0;
+    }
+    const char *p = strrchr(dep->d_name, '.') + 1;
+    return isdigit(*p) ? 1 : 0;
+}
+
 static int remedy()
 {
-    char path[sizeof(UPLOAD_PATH) + 128];
-    int n = snprintf(path, sizeof(path), "%s%s", CWD_ROOT, UPLOAD_PATH);
+    char path[sizeof(RAW_LOG_PATH) + 128];
+    int n = snprintf(path, sizeof(path), "%s%s", CWD_ROOT, RAW_LOG_PATH);
     if (n < 0) {
+        write_log(app_log_path, LOG_ERR, "snprintf failed in remedy");
+        return -1;
+    }
+
+    int total1 = 0, total2 = 0;
+    struct dirent **namelist = NULL;
+
+    for (int i = 0; i < topic_total; i++) {
+        int m = snprintf(path + n, sizeof(path) - n , "/%s", topics[i]);
+
+        int num = scandir(path, &namelist, scandir_filter_3, scandir_compar_2);
+        if (num == -1) {
+            write_log(app_log_path, LOG_ERR, "scandir[%s] failed"
+                      " with errno[%d]", path, errno);
+            continue;
+        }
+        for (int i = 0; i < num; i++) {
+            struct dirent *dep = namelist[i];
+            if (snprintf(path + n + m, sizeof(path) - n - m,
+                         "/%s", dep->d_name) < 0) {
+                free(dep);
+                continue;
+            }
+            write_log(app_log_path, LOG_INFO, "remedy[%s]", path);
+            // TODO non-blocking exit code
+            lzo_compress(path);
+            total1++;
+            free(dep);
+        }
+
+        free(namelist);
+    }
+
+    write_log(app_log_path, LOG_INFO, "compressing %d files for remedy", total1);
+
+    if ((n = snprintf(path, sizeof(path), "%s%s", CWD_ROOT, UPLOAD_PATH)) < 0) {
         write_log(app_log_path, LOG_ERR, "snprintf failed");
         return -1;
     }
 
-    int total = 0;
-    struct dirent **namelist = NULL;
     for (int i = 0; i < topic_total; i++) {
         int m = snprintf(path + n, sizeof(path) - n , "/%s", topics[i]);
 
@@ -1630,14 +1762,14 @@ static int remedy()
             snprintf(path + n + m, sizeof(path) - n - m, "/%s", dep->d_name);
             write_log(app_log_path, LOG_INFO, "remedy[%s]", path);
             que.push_back(path);
-            total++;
+            total2++;
             free(dep);
         }
 
         free(namelist);
     }
 
-    return total;
+    return total1 + total2;
 }
 
 int main(int argc, char *argv[])
