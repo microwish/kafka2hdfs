@@ -545,7 +545,7 @@ static bool build_local_path(const char *payload, const char *topic, long ymdhm,
     if (strcmp(topic, "unbid") == 0 || strcmp(topic, "bid") == 0) {
         char device[8];
         if (!extract_device(payload, device)) {
-            write_log(app_log_path, LOG_ERR,
+            write_log(app_log_path, LOG_WARNING,
                       "extract_device[%s] topic[%s] failed", payload, topic);
             return false;
         }
@@ -1181,6 +1181,9 @@ static int copy(const char *topic, const char *zfile)
     }
 
     bool existing = hdfsExists(fs_handle, hdfs_path) == 0;
+    if (existing) {
+        write_log(app_log_path, LOG_INFO, "HDFS[%s] exists already", hdfs_path);
+    }
 
     if (st.st_size > INT_MAX) {
         char *p = strrchr(hdfs_path, '/');
@@ -1217,7 +1220,7 @@ static int copy(const char *topic, const char *zfile)
     hdfsFile file_handle = hdfsOpenFile(fs_handle, hdfs_path, flags, 0, 0, 0);
     if (file_handle == NULL) {
         write_log(app_log_path, LOG_ERR,
-                  "hdfsOpenFile[%s] failed with errno[%d]", zfile, errno);
+                  "hdfsOpenFile[%s] failed with errno[%d]", hdfs_path, errno);
         // XXX
         // comments borrowed from Impala:
 /// A (process-wide) cache of hdfsFS objects.
@@ -1304,7 +1307,6 @@ static int copy_ex(const char *topic, const char *zfile, bool indexed = true)
 
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "hadoop fs -test -e %s", hdfs_path);
-
     if (wrap_system(cmd, false) != 0) {
         snprintf(cmd, sizeof(cmd), "hadoop fs -mkdir -p %s", hdfs_path);
         if (wrap_system(cmd) != 0) return -1;
@@ -1313,20 +1315,25 @@ static int copy_ex(const char *topic, const char *zfile, bool indexed = true)
     *p = '/';
 
     snprintf(cmd, sizeof(cmd), "hadoop fs -test -e %s", hdfs_path);
-    if (wrap_system(cmd, false) != 0) {
-        if (hdfs_put(zfile, hdfs_path, true, indexed) == 0) {
-            write_log(app_log_path, LOG_INFO, "DEBUG hdfs_put[%s] OK", zfile);
+    // files whose names end with ".0.lzo"
+    while (wrap_system(cmd, false) == 0) {
+        write_log(app_log_path, LOG_WARNING,
+                  "HDFS file[%s] already existing", hdfs_path);
+        p = strrchr(hdfs_path, '.');
+        if (*(p - 2) == '.') {
+            char c = *(p - 1) + 1;
+            *(p - 1) = c;
+            snprintf(cmd, sizeof(cmd), "hadoop fs -test -e %s", hdfs_path);
         } else {
-            return -1;
-        }
-    } else {
-        if (hdfs_append(zfile, hdfs_path, true, indexed) == 0) {
-            write_log(app_log_path, LOG_INFO,
-                      "DEBUG hdfs_append[%s] OK", zfile);
-        } else {
+            write_log(app_log_path, LOG_WARNING,
+                      "unexpected HDFS path[%s]", hdfs_path);
             return -1;
         }
     }
+    if (hdfs_put(zfile, hdfs_path, true, indexed) != 0) {
+        return -1;
+    }
+
     return 0;
 }
 
@@ -1539,7 +1546,7 @@ static int scandir_filter_4(const struct dirent *dep)
         // XXX
         if (errno != ENOENT) {
             write_log(app_log_path, LOG_ERR, "stat[%s] for mtime failed"
-                      " with errno[%d]", path, errno);
+                      " with errno[%d]", dep->d_name, errno);
         }
         return 0;
     }
@@ -1548,6 +1555,23 @@ static int scandir_filter_4(const struct dirent *dep)
 
 static int handle_delayed_upload(const char *topic)
 {
+    time_t ts;
+    struct timeval tv;
+    if (gettimeofday(&tv, NULL) != 0) {
+        write_log(app_log_path, LOG_ERR,
+                  "gettimeofday failed with errno[%d]", errno);
+        return -1;
+    } else {
+        // roughly every 30 minutes
+        if (tv.tv_sec % 1800 == 0 && tv.tv_usec % 200000 == 0) {
+            ts = tv.tv_sec;
+            write_log(app_log_path, LOG_INFO,
+                      "doing[@%ld] handle_delayed_upload", ts);
+        } else {
+            return 0;
+        }
+    }
+
     char cwd[128], temp[256];
 
     // should always be /data/users/data-infra/kafka2hdfs
@@ -1574,7 +1598,21 @@ static int handle_delayed_upload(const char *topic)
         for (int i = 0; i < num; i++) {
             struct dirent *dep = namelist[i];
             snprintf(temp + n, sizeof(temp) - n, "/%s", dep->d_name);
-            rename(dep->d_name, temp);
+            if (rename(dep->d_name, temp) == 0) {
+                time_t ts2 = ts - (BUFFER_MINUTES + 1) * 60;
+                struct timeval times[2];
+                times[0].tv_sec = ts2;
+                times[0].tv_usec = 0;
+                times[1].tv_sec = ts2;
+                times[1].tv_usec = 0;
+                if (utimes(temp, times) != 0) {
+                    write_log(app_log_path, LOG_ERR,
+                              "utimes[%s] failed with errno[%d]", temp, errno);
+                } else {
+                    write_log(app_log_path, LOG_INFO,
+                              "utimes[%s] time[%ld]", temp, ts2);
+                }
+            }
             write_log(app_log_path, LOG_INFO,
                       "recovering delayed file[%s]", temp);
             free(dep);
