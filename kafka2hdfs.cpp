@@ -135,6 +135,9 @@ static int64_t start_offset = KAFKA_OFFSET_STORED;
 static std::map<std::string, std::deque<std::string> > upload_queues;
 static std::map<std::string, pthread_mutex_t> upload_mutexes;
 
+static std::map<std::string, hdfsFS> hdfs_handle_cache;
+static pthread_rwlock_t hdfs_handle_lock = PTHREAD_RWLOCK_INITIALIZER;
+
 // TODO optimaztion needed
 static bool align_YmdHM(char *YmdHM, int interval)
 {
@@ -1156,11 +1159,23 @@ static int hdfs_lzo_index(const char *hdfs_path)
 
 #define HDFS_USER "data-infra"
 
-static int copy(const char *topic, const char *zfile)
+static int init_hdfs_handle_cache()
 {
-    char hdfs_path[256];
-    if (!build_hdfs_path(topic, basename(zfile), hdfs_path)) {
-        return -1;
+    char handle_key[256];
+    snprintf(handle_key, sizeof(handle_key), "%s^%s^%s",
+             k2h_conf["namenode"].c_str(), k2h_conf["port"].c_str(), HDFS_USER);
+
+    pthread_rwlock_wrlock(&hdfs_handle_lock);
+
+    std::map<std::string, hdfsFS>::iterator it =
+        hdfs_handle_cache.find(handle_key);
+    if (it != hdfs_handle_cache.end()) {
+        if (it->second != NULL) {
+            if (hdfsDisconnect(it->second) != 0) {
+                write_log(app_log_path, LOG_WARNING, "hdfsDisconnect failed");
+            }
+            it->second = NULL;
+        }
     }
 
     hdfsFS fs_handle = hdfsConnectAsUser(k2h_conf["namenode"].c_str(),
@@ -1168,9 +1183,81 @@ static int copy(const char *topic, const char *zfile)
                                          HDFS_USER);
     if (fs_handle == NULL) {
         write_log(app_log_path, LOG_ERR,
-                  "hdfsConnect[%s:%s] failed with errno[%d]",
-                 k2h_conf["namenode"].c_str(), k2h_conf["port"].c_str(), errno);
+                  "hdfsConnect[%s] failed with errno[%d]",
+                  handle_key, errno);
+        pthread_rwlock_unlock(&hdfs_handle_lock);
         return -1;
+    }
+
+    if (it != hdfs_handle_cache.end()) {
+        it->second = fs_handle;
+    } else {
+        hdfs_handle_cache.insert(std::pair<std::string, hdfsFS>(handle_key,
+                                                                fs_handle));
+    }
+
+    pthread_rwlock_unlock(&hdfs_handle_lock);
+
+    return 1;
+}
+
+static void destroy_hdfs_handle_cache()
+{
+    pthread_rwlock_wrlock(&hdfs_handle_lock);
+
+    for (std::map<std::string, hdfsFS>::iterator it = hdfs_handle_cache.begin();
+         it != hdfs_handle_cache.end(); it++) {
+        if (it->second != NULL) {
+            if (hdfsDisconnect(it->second) != 0) {
+                write_log(app_log_path, LOG_WARNING, "hdfsDisconnect failed");
+            }
+            it->second = NULL;
+        }
+    }
+
+    pthread_rwlock_unlock(&hdfs_handle_lock);
+}
+
+static hdfsFS get_hdfs_handle(const char *key = NULL)
+{
+    hdfsFS handle;
+    pthread_rwlock_rdlock(&hdfs_handle_lock);
+
+    if (key != NULL) {
+        std::map<std::string, hdfsFS>::iterator it =
+            hdfs_handle_cache.find(key);
+        if (it == hdfs_handle_cache.end()) {
+            write_log(app_log_path, LOG_WARNING,
+                      "hdfs_handle_cache no such key[%s]", key);
+            handle = NULL;
+        } else {
+            handle = it->second;
+        }
+    } else {
+        handle = hdfs_handle_cache.begin()->second;
+    }
+
+    pthread_rwlock_unlock(&hdfs_handle_lock);
+    return handle;
+}
+
+static int copy(const char *topic, const char *zfile)
+{
+    char hdfs_path[256];
+    if (!build_hdfs_path(topic, basename(zfile), hdfs_path)) {
+        return -1;
+    }
+
+    int retries = 0;
+    hdfsFS fs_handle = get_hdfs_handle();
+    while (fs_handle == NULL) {
+        if (init_hdfs_handle_cache() == -1) return -1;
+        fs_handle = get_hdfs_handle();
+        if (++retries == 3) {
+            write_log(app_log_path, LOG_ERR,
+                      "get_hdfs_handle failed after % retries", retries);
+            return -1;
+        }
     }
 
     struct stat st;
@@ -1315,19 +1402,31 @@ static int copy_ex(const char *topic, const char *zfile, bool indexed = true)
     *p = '/';
 
     snprintf(cmd, sizeof(cmd), "hadoop fs -test -e %s", hdfs_path);
-    // files whose names end with ".0.lzo"
-    while (wrap_system(cmd, false) == 0) {
+    if (wrap_system(cmd, false) == 0) {
         write_log(app_log_path, LOG_WARNING,
                   "HDFS file[%s] already existing", hdfs_path);
-        p = strrchr(hdfs_path, '.');
-        if (*(p - 2) == '.') {
-            char c = *(p - 1) + 1;
-            *(p - 1) = c;
-            snprintf(cmd, sizeof(cmd), "hadoop fs -test -e %s", hdfs_path);
+        size_t l = strlen(hdfs_path);
+        if (strncmp(hdfs_path + l - 4, ".seq", 4) == 0) {
+            if (hdfs_append(zfile, hdfs_path, true, indexed) != 0) {
+                return -1;
+            } else {
+                return 0;
+            }
         } else {
-            write_log(app_log_path, LOG_WARNING,
-                      "unexpected HDFS path[%s]", hdfs_path);
-            return -1;
+            // files whose names end with ".0.lzo"
+            do {
+                p = strrchr(hdfs_path, '.');
+                if (*(p - 2) == '.') {
+                    char c = *(p - 1) + 1;
+                    *(p - 1) = c;
+                    snprintf(cmd, sizeof(cmd),
+                             "hadoop fs -test -e %s", hdfs_path);
+                } else {
+                    write_log(app_log_path, LOG_WARNING,
+                              "unexpected HDFS path[%s]", hdfs_path);
+                    return -1;
+                }
+            } while (wrap_system(cmd, false) == 0);
         }
     }
     if (hdfs_put(zfile, hdfs_path, true, indexed) != 0) {
@@ -1920,6 +2019,15 @@ for (std::map<std::string, int>::const_iterator it =
         exit(EXIT_FAILURE);
     }
 
+    if (init_hdfs_handle_cache() < 1) {
+        write_log(app_log_path, LOG_ERR, "init_hdfs_handle_cache failed");
+        destroy_topics();
+        free_consumer();
+        free(thrs);
+        free_topics_partnos();
+        exit(EXIT_FAILURE);
+    }
+
     int n = remedy(), ret;
     write_log(app_log_path, LOG_INFO, "%d files remedy", n);
 
@@ -2007,6 +2115,7 @@ for (std::map<std::string, int>::const_iterator it =
     free_consumer();
     free(thrs);
     free_topics_partnos();
+    destroy_hdfs_handle_cache();
 
     exit(EXIT_SUCCESS);
 }
