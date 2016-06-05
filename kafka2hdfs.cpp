@@ -57,12 +57,15 @@ public:
     }
 };
 
+static int no;
+
 static char *consumer_conf_path;
 static std::map<std::string, std::string> k2h_conf;
 
 static int topic_total;
 static char **topics = NULL;
 static int *partnos = NULL;
+static std::map<char *, std::vector<int> > topic_partnos;
 
 static std::map<std::string, int> upload_intervals;
 
@@ -122,6 +125,7 @@ static const char *hdfs_path_pydmp_imp = "/user/data-infra/pydmp/imp";
 static const char *hdfs_path_pydmp_adv = "/user/data-infra/pydmp/adv";
 static const char *hdfs_path_pydmp_click = "/user/data-infra/pydmp/click";
 static const char *hdfs_path_pydmp_cvt = "/user/data-infra/pydmp/cvt";
+static const char *hdfs_path_tencentdmp = "/user/root/flume/dmp/tencent";
 
 static std::map<const char *, const char *> topic_hdfs_map;
 
@@ -287,6 +291,27 @@ static void str_split(const std::string& s, char delim,
     }
 }
 
+// unbid:60:0-24
+// unbid:60:25-59
+static void parse_partno_detail(const std::string& partnos, int bound,
+                                std::vector<int>& result)
+{
+    const char *p = strchr(partnos.c_str(), '-');
+    if (p == NULL) {
+        write_log(app_log_path, LOG_WARNING,
+                  "invalide partition number list[%s]", partnos.c_str());
+        return;
+    }
+    int e = atoi(p + 1);
+    if (e >= bound) {
+        write_log(app_log_path, LOG_WARNING, "invalid right bound[%d]", e);
+        e = bound - 1;
+    }
+    for (int i = atoi(partnos.c_str()); i <= e; i++) {
+        result.push_back(i);
+    }
+}
+
 static int extract_topics_partnos(const std::string& s)
 {
     int n = 0, m;
@@ -310,6 +335,12 @@ static int extract_topics_partnos(const std::string& s)
         topics[i] = strdup(vec2[0].c_str());
         partnos[i] = m;
         n += m;
+        if (vec2.size() == 3) {
+            std::vector<int> nos;
+            parse_partno_detail(vec2[2], m, nos);
+            topic_partnos.insert(
+                std::pair<char *, std::vector<int> >(topics[i], nos));
+        }
         vec2.clear();
     }
 
@@ -334,6 +365,11 @@ static void extract_intervals(const std::string& s)
 
 static bool extract_YmdHM(const char *topic, const char *s, char *YmdHM)
 {
+    if (strcmp(topic, "tencentdmp") == 0) {
+        snprintf(YmdHM, 13, "%s", s);
+        return true;
+    }
+
     int n = 0, index;
     const char *temp = s, *p;
 
@@ -552,18 +588,18 @@ static bool build_local_path(const char *payload, const char *topic, long ymdhm,
                       "extract_device[%s] topic[%s] failed", payload, topic);
             return false;
         }
-        snprintf(path, 128, "%s%s/%s/%s_%ld_%s.seq",
-                 CWD_ROOT, RAW_LOG_PATH, topic, topic, ymdhm, device);
+        snprintf(path, 128, "%s%s%d/%s/%s_%ld_%s_%d.seq",
+                 CWD_ROOT, RAW_LOG_PATH, no, topic, topic, ymdhm, device, no);
     } else if (strcmp(topic, "imp") == 0 || strcmp(topic, "ic") == 0) {
         int actiontype = extract_action_type(payload);
         switch (actiontype) {
         case 1: // impression
-            snprintf(path, 128, "%s%s/%s/imp_%ld.seq",
-                     CWD_ROOT, RAW_LOG_PATH, topic, ymdhm);
+            snprintf(path, 128, "%s%s%d/%s/imp_%ld_%d.seq",
+                     CWD_ROOT, RAW_LOG_PATH, no, topic, ymdhm, no);
             break;
         case 2: // click
-            snprintf(path, 128, "%s%s/%s/click_%ld.seq",
-                     CWD_ROOT, RAW_LOG_PATH, topic, ymdhm);
+            snprintf(path, 128, "%s%s%d/%s/click_%ld_%d.seq",
+                     CWD_ROOT, RAW_LOG_PATH, no, topic, ymdhm, no);
             break;
         default:
             write_log(app_log_path, LOG_WARNING,
@@ -575,12 +611,12 @@ static bool build_local_path(const char *payload, const char *topic, long ymdhm,
         int actiontype = extract_action_type(payload);
         switch (actiontype) {
         case 11: // impression
-            snprintf(path, 128, "%s%s/%s/imp_%ld.seq",
-                     CWD_ROOT, RAW_LOG_PATH, topic, ymdhm);
+            snprintf(path, 128, "%s%s%d/%s/imp_%ld_%d.seq",
+                     CWD_ROOT, RAW_LOG_PATH, no, topic, ymdhm, no);
             break;
         case 12: // click
-            snprintf(path, 128, "%s%s/%s/click_%ld.seq",
-                     CWD_ROOT, RAW_LOG_PATH, topic, ymdhm);
+            snprintf(path, 128, "%s%s%d/%s/click_%ld_%d.seq",
+                     CWD_ROOT, RAW_LOG_PATH, no, topic, ymdhm, no);
             break;
         default: // invalid for ic or stats
             write_log(app_log_path, LOG_WARNING,
@@ -589,8 +625,8 @@ static bool build_local_path(const char *payload, const char *topic, long ymdhm,
             return false;
         }
     } else {
-        snprintf(path, 128, "%s%s/%s/%s_%ld.seq",
-                 CWD_ROOT, RAW_LOG_PATH, topic, topic, ymdhm);
+        snprintf(path, 128, "%s%s%d/%s/%s_%ld_%d.seq",
+                 CWD_ROOT, RAW_LOG_PATH, no, topic, topic, ymdhm, no);
     }
 
     return true;
@@ -742,7 +778,7 @@ static off_t get_file_size(const char *path)
     return stbuf.st_size;
 }
 
-#define BUFFER_MINUTES 5
+#define BUFFER_MINUTES 3
 
 //static bool is_write_finished(const char *path, const char *topic)
 static bool is_write_finished(const char *path, int minutes = BUFFER_MINUTES)
@@ -849,7 +885,7 @@ static int scandir_compar_2(const struct dirent **a, const struct dirent **b)
     return strcmp((*a)->d_name, (*b)->d_name);
 }
 
-// only bid and unbid need to be compressed
+// bid and unbid only need to be compressed
 static void *compress_files(void *arg)
 {
     char *topic = (char *)arg;
@@ -874,8 +910,8 @@ static void *compress_files(void *arg)
     }
 
     char path[sizeof(RAW_LOG_PATH) + 128], path2[sizeof(RAW_LOG_PATH) + 128];
-    int n = snprintf(path, sizeof(path), "%s%s/%s",
-                     CWD_ROOT, RAW_LOG_PATH, topic);
+    int n = snprintf(path, sizeof(path), "%s%s%d/%s",
+                     CWD_ROOT, RAW_LOG_PATH, no, topic);
     if (n < 0) {
         write_log(app_log_path, LOG_ERR, "snprintf topic[%s] failed", topic);
         write_log(app_log_path, LOG_ERR, "thread compress_files"
@@ -904,7 +940,7 @@ static void *compress_files(void *arg)
             if (is_write_finished(path)) {
                 snprintf(path2 + n, sizeof(path2) - n, "/%s.0", dep->d_name);
                 write_log(app_log_path, LOG_INFO,
-                          "DEBUG path[%s] writing finished", path);
+                          "DEBUG path[%s] writing finished", path2);
             } else if (get_file_size(path) > MAX_FILE_SIZE) {
                 snprintf(path2 + n, sizeof(path2) - n, "/%s.%ld",
                          dep->d_name, time(NULL));
@@ -1029,6 +1065,8 @@ static void init_topic_hdfs_map()
             topic_hdfs_map[topic] = hdfs_path_pydmp_click;
         } else if (strcmp(topic, "pydmpcvt") == 0) {
             topic_hdfs_map[topic] = hdfs_path_pydmp_cvt;
+        } else if (strcmp(topic, "tencentdmp") == 0) {
+            topic_hdfs_map[topic] = hdfs_path_tencentdmp;
         }
     }
 }
@@ -1255,7 +1293,7 @@ static int copy(const char *topic, const char *zfile)
         fs_handle = get_hdfs_handle();
         if (++retries == 3) {
             write_log(app_log_path, LOG_ERR,
-                      "get_hdfs_handle failed after % retries", retries);
+                      "get_hdfs_handle failed after %d retries", retries);
             return -1;
         }
     }
@@ -1404,7 +1442,7 @@ static int copy_ex(const char *topic, const char *zfile, bool indexed = true)
     snprintf(cmd, sizeof(cmd), "hadoop fs -test -e %s", hdfs_path);
     if (wrap_system(cmd, false) == 0) {
         write_log(app_log_path, LOG_WARNING,
-                  "HDFS file[%s] already existing", hdfs_path);
+                  "HDFS file[%s] already exists", hdfs_path);
         size_t l = strlen(hdfs_path);
         if (strncmp(hdfs_path + l - 4, ".seq", 4) == 0) {
             if (hdfs_append(zfile, hdfs_path, true, indexed) != 0) {
@@ -1413,18 +1451,19 @@ static int copy_ex(const char *topic, const char *zfile, bool indexed = true)
                 return 0;
             }
         } else {
-            // files whose names end with ".0.lzo"
             do {
                 p = strrchr(hdfs_path, '.');
                 if (*(p - 2) == '.') {
+                    // files whose names end with ".0.lzo"
                     char c = *(p - 1) + 1;
                     *(p - 1) = c;
                     snprintf(cmd, sizeof(cmd),
                              "hadoop fs -test -e %s", hdfs_path);
                 } else {
-                    write_log(app_log_path, LOG_WARNING,
-                              "unexpected HDFS path[%s]", hdfs_path);
-                    return -1;
+                    // seq.1461669096.lzo
+                    memcpy(p + 1, "0.lzo", sizeof("0.lzo") - 1);
+                    snprintf(cmd, sizeof(cmd),
+                             "hadoop fs -test -e %s", hdfs_path);
                 }
             } while (wrap_system(cmd, false) == 0);
         }
@@ -1540,8 +1579,8 @@ static void *enqueue_upload_files(void *arg)
     }
 
     char path[sizeof(RAW_LOG_PATH) + 128];
-    int n = snprintf(path, sizeof(path), "%s%s/%s",
-                     CWD_ROOT, RAW_LOG_PATH, topic);
+    int n = snprintf(path, sizeof(path), "%s%s%d/%s",
+                     CWD_ROOT, RAW_LOG_PATH, no, topic);
     if (n < 0) {
         write_log(app_log_path, LOG_ERR, "snprintf failed");
         write_log(app_log_path, LOG_ERR, "thread enqueue_upload_files"
@@ -1584,8 +1623,9 @@ static void *enqueue_upload_files(void *arg)
                     free(dep);
                     continue;
                 }
-                int n2 = snprintf(path2, sizeof(path2), "%s%s/%s/%s",
-                                  CWD_ROOT, UPLOAD_PATH, topic, dep->d_name);
+                int n2 = snprintf(path2, sizeof(path2), "%s%s%d/%s/%s",
+                                  CWD_ROOT, UPLOAD_PATH, no,
+                                  topic, dep->d_name);
                 if (n2 < 0) {
                     write_log(app_log_path, LOG_ERR,
                               "snprintf[%s] to rename failed", dep->d_name);
@@ -1678,7 +1718,7 @@ static int handle_delayed_upload(const char *topic)
         write_log(app_log_path, LOG_ERR, "getcwd failed with errno[%d]", errno);
         return -1;
     }
-    snprintf(temp, sizeof(temp), "%supload/%s", CWD_ROOT, topic);
+    snprintf(temp, sizeof(temp), "%supload%d/%s", CWD_ROOT, no, topic);
     if (chdir(temp) == -1) {
         write_log(app_log_path, LOG_ERR,
                   "chdir[%s] failed with errno[%d]", temp, errno);
@@ -1693,7 +1733,8 @@ static int handle_delayed_upload(const char *topic)
         chdir(cwd);
         return -1;
     } else if (num > 0) {
-        int n = snprintf(temp, sizeof(temp), "%sk2h_log/%s", CWD_ROOT, topic);
+        int n = snprintf(temp, sizeof(temp), "%sk2h_log%d/%s",
+                         CWD_ROOT, no, topic);
         for (int i = 0; i < num; i++) {
             struct dirent *dep = namelist[i];
             snprintf(temp + n, sizeof(temp) - n, "/%s", dep->d_name);
@@ -1840,7 +1881,7 @@ static int scandir_filter_3(const struct dirent *dep)
 static int remedy()
 {
     char path[sizeof(RAW_LOG_PATH) + 128];
-    int n = snprintf(path, sizeof(path), "%s%s", CWD_ROOT, RAW_LOG_PATH);
+    int n = snprintf(path, sizeof(path), "%s%s%d", CWD_ROOT, RAW_LOG_PATH, no);
     if (n < 0) {
         write_log(app_log_path, LOG_ERR, "snprintf failed in remedy");
         return -1;
@@ -1877,7 +1918,8 @@ static int remedy()
 
     write_log(app_log_path, LOG_INFO, "compressing %d files for remedy", total1);
 
-    if ((n = snprintf(path, sizeof(path), "%s%s", CWD_ROOT, UPLOAD_PATH)) < 0) {
+    if ((n = snprintf(path, sizeof(path), "%s%s%d",
+                      CWD_ROOT, UPLOAD_PATH, no)) < 0) {
         write_log(app_log_path, LOG_ERR, "snprintf failed");
         return -1;
     }
@@ -1915,7 +1957,7 @@ int main(int argc, char *argv[])
     char *k2h_conf_path, *offset_opt;
 
     do {
-        opt = getopt(argc, argv, "c:k:l:o:");
+        opt = getopt(argc, argv, "c:k:l:o:n:");
         switch (opt) {
         case 'c':
             consumer_conf_path = optarg;
@@ -1933,6 +1975,10 @@ int main(int argc, char *argv[])
         case 'o':
             offset_opt = optarg;
             fprintf(stderr, "offset option for kafka2hdfs: %s\n", offset_opt);
+            break;
+        case 'n':
+            no = atoi(optarg);
+            fprintf(stderr, "process no.: %d\n", no);
             break;
         default:
             // XXX
@@ -2033,22 +2079,47 @@ for (std::map<std::string, int>::const_iterator it =
 
     n = 0;
     for (int i = 0; i < topic_total; i++) {
-        for (int j = 0; j < partnos[i]; j++) {
-            ThrArg *arg = new ThrArg(kcts[i], j);
-            ret = pthread_create(&thrs[n], NULL, consume_to_local, (void *)arg);
-            if (ret != 0) {
-                write_log(app_log_path, LOG_ERR,
-                          "pthread_create[consume_to_local] for "
-                          "topic[%s] partition[%d] failed with errno[%d]",
-                          topics[i], j, ret);
-                clear_fp_cache();
-                destroy_topics();
-                free_consumer();
-                free(thrs);
-                free_topics_partnos();
-                exit(EXIT_FAILURE);
+        std::map<char *, std::vector<int> >::iterator it =
+            topic_partnos.find(topics[i]);
+        if (it == topic_partnos.end()) {
+            for (int j = 0; j < partnos[i]; j++) {
+                ThrArg *arg = new ThrArg(kcts[i], j);
+                ret = pthread_create(&thrs[n], NULL, consume_to_local,
+                                     (void *)arg);
+                if (ret != 0) {
+                    write_log(app_log_path, LOG_ERR,
+                              "pthread_create[consume_to_local] for "
+                              "topic[%s] partition[%d] failed with errno[%d]",
+                              topics[i], j, ret);
+                    clear_fp_cache();
+                    destroy_topics();
+                    free_consumer();
+                    free(thrs);
+                    free_topics_partnos();
+                    exit(EXIT_FAILURE);
+                }
+                n++;
             }
-            n++;
+        } else {
+            std::vector<int>& nos = it->second;
+            for (size_t j = 0; j < nos.size(); j++) {
+                ThrArg *arg = new ThrArg(kcts[i], nos[j]);
+                ret = pthread_create(&thrs[n], NULL, consume_to_local,
+                                     (void *)arg);
+                if (ret != 0) {
+                    write_log(app_log_path, LOG_ERR,
+                              "pthread_create[consume_to_local] for "
+                              "topic[%s] partition[%d] failed with errno[%d]",
+                              topics[i], nos[j], ret);
+                    clear_fp_cache();
+                    destroy_topics();
+                    free_consumer();
+                    free(thrs);
+                    free_topics_partnos();
+                    exit(EXIT_FAILURE);
+                }
+                n++;
+            }
         }
 
         if (strcmp(topics[i], "bid") == 0 || strcmp(topics[i], "unbid") == 0) {
